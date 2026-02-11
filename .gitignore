@@ -1,0 +1,5 @@
+# Ignore course folder
+61A/
+
+# Ignore Python cache
+__pycache__/
