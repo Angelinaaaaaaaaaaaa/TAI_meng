@@ -113,7 +113,7 @@ class FolderStats:
     primary_extensions: List[str]
 
 
-DEFAULT_CONFIDENCE_THRESHOLD = 0.7
+DEFAULT_CONFIDENCE_THRESHOLD = 0.75
 
 
 @dataclass
