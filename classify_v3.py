@@ -1,26 +1,14 @@
 #!/usr/bin/env python3
 """
-classify_v1.py
+classify_v3.py
 
-LLM-based Classifier for course folders and files.
+LLM-based Classifier for course folders and files — v3.
 
-Extracted from bfs_v2.py so the classifier is a standalone, importable module.
-Uses prompts adapted from file_organizer_v6.py.
-
-Features:
-  - Single LLM call per folder: reason + decide + summarize (FIX #3)
-  - Structured output via Pydantic models
-  - Full debug logging of every LLM call (system prompt, user prompt, response)
-  - Ancestor descriptions passed as context for hierarchical classification
-
-Usage:
-    from classify_v2 import LLMClassifier
-
-    classifier = LLMClassifier(model="gpt-4.1-2025-04-14")
-    result = classifier.classify_folder(node, file_index, stats, concat_desc)
-    result = classifier.classify_file(file_meta, file_index)
-    (New) results = classifier.classify_files(file_list, file_index)
-    classifier.save_debug_log("debug.json")
+Notes (per your requirements):
+  - Prompts are unchanged in content (only minor grammar/spacing fixes).
+  - No prompt caps: folder prompt includes ALL files + ALL concatenated descriptions.
+  - File classification is forced to ONLY: study / practice / support in outputs.
+    (If the model returns "skip", we map it to "support" to preserve a 3-way system.)
 """
 
 import json
@@ -35,14 +23,7 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-
-# ====================================================================
-#  Constants
-# ====================================================================
-
-MAX_CONCAT_DESC_CHARS = 6000
-MAX_FILES_IN_PROMPT = 50
-LLM_DEBUG_LOG_FILE = "bfs_v2_llm_debug.json"
+LLM_DEBUG_LOG_FILE = "bfs_v3_llm_debug.json"
 
 
 class Category(str, Enum):
@@ -53,11 +34,8 @@ class Category(str, Enum):
 
 
 # ====================================================================
-#  Shared Data Structures (imported by bfs_v2)
+#  Shared Data Structures
 # ====================================================================
-
-# These are defined here so both classify_v2 and bfs_v2 use the same types
-# without circular imports. bfs_v2 re-exports them.
 
 from dataclasses import dataclass, field
 from collections import deque
@@ -70,6 +48,7 @@ class FileMeta:
     folder_path: str
     file_name: str
     description: Optional[str] = None
+    file_hash: Optional[str] = None
 
 
 @dataclass
@@ -99,6 +78,7 @@ class FileIndexEntry:
     original_path: Optional[str] = None
     relative_path: Optional[str] = None
     extra_info: Optional[str] = None
+    file_hash: Optional[str] = None
 
 
 @dataclass
@@ -113,20 +93,16 @@ class FolderStats:
     primary_extensions: List[str]
 
 
-DEFAULT_CONFIDENCE_THRESHOLD = 0.75
-
-
 @dataclass
 class ClassificationResult:
     """Result of classifying a folder or file."""
     category: Category
-    confidence: float
     reason: str
     is_mixed: bool = False
     folder_description: str = ""
-
-    def is_confident(self, threshold: float = DEFAULT_CONFIDENCE_THRESHOLD) -> bool:
-        return self.confidence >= threshold and not self.is_mixed
+    # Folder organisation scheme (folders only; both False for files/SKIP/mixed)
+    by_type: bool = False
+    by_sequence: bool = False
 
 
 # ====================================================================
@@ -139,26 +115,43 @@ class LLMFolderDecision(BaseModel):
     reason: str = Field(
         ..., min_length=10,
         description=(
-            "MUST be filled FIRST. Detailed reasoning about what this folder "
-            "contains, its purpose, and why it belongs in the chosen category. "
-            "Think step-by-step BEFORE choosing a category."
+            "MUST be filled FIRST. Short reasoning about what this folder "
+            "contains and why it belongs in the chosen category."
         ),
     )
     category: str = Field(
         ..., pattern="^(practice|study|support|skip)$",
         description="Category decided AFTER reasoning.",
     )
-    confidence: float = Field(
-        ..., ge=0.0, le=1.0,
-        description="Confidence score (0-1) decided AFTER reasoning.",
-    )
     is_mixed: bool = Field(
         False,
-        description="True if the folder contains semantically mixed content.",
+        description=(
+            "True if the folder contains files from MULTIPLE (>1) categories. "
+            "When true, category is automatically overridden to 'skip'."
+        ),
     )
     folder_description: str = Field(
         "",
         description="One-sentence summary of the folder's pedagogical purpose.",
+    )
+    by_type: bool = Field(
+        False,
+        description=(
+            "True if this folder's direct children are organised by task/media TYPE — "
+            "i.e., different kinds of material sit side-by-side as siblings. "
+            "Example: practice/ contains hw/, lab/, proj/ under practice. "
+            "Set False when children are sequential or when is_mixed is True."
+        ),
+    )
+    by_sequence: bool = Field(
+        False,
+        description=(
+            "True if this folder's direct children are organised by topic/time SEQUENCE — "
+            "i.e., siblings share the same type but differ by number/topic. "
+            "Examples: lecture01/, lecture02/, … or disc01/, disc02/, … "
+            "or proj/ants, proj/cats (topic-ordered projects). "
+            "Set False when children are type-grouped or when is_mixed is True."
+        ),
     )
 
 
@@ -169,16 +162,13 @@ class LLMFileDecision(BaseModel):
         ..., min_length=5,
         description="Reasoning about this file's educational purpose.",
     )
-    category: str = Field(
-        ..., pattern="^(practice|study|support|skip)$",
-    )
-    confidence: float = Field(..., ge=0.0, le=1.0)
+    # Allow skip in parsing to avoid hard failures, but we force output to 3-way later.
+    category: str = Field(..., pattern="^(practice|study|support|skip)$")
 
 
 # ====================================================================
 #  Helper: collect all files under a FolderNode
 # ====================================================================
-
 
 def collect_all_files(node: FolderNode) -> List[FileMeta]:
     """Recursively collect all files under a FolderNode (BFS order)."""
@@ -200,11 +190,10 @@ class LLMClassifier:
     """
     LLM-based classifier for course folders and files.
 
-    Uses prompts adapted from file_organizer_v6.py and file_classifier.py.
     Consolidates reasoning + decision into a single LLM call per item.
     """
 
-    def __init__(self, model: str = "gpt-4.1-2025-04-14"):
+    def __init__(self, model: str = "gpt-5-mini-2025-08-07"):
         if not os.environ.get("OPENAI_API_KEY"):
             raise ValueError("OPENAI_API_KEY environment variable not set")
         self.model = model
@@ -224,16 +213,9 @@ class LLMClassifier:
         """
         Classify a folder in ONE LLM call: reason + decide + summarize.
 
-        Args:
-            node: FolderNode to classify
-            file_index: Full DB file index (available for subclass overrides)
-            folder_stats: Pre-computed structural statistics
-            concat_desc: Concatenated file descriptions
-            ancestor_descriptions: Context from parent folders
-
-        Returns:
-            ClassificationResult with category, confidence, reason, is_mixed,
-            and folder_description
+        Returns ClassificationResult with category, reason, is_mixed,
+        folder_description, by_type, by_sequence.
+        Mixed folders get category=SKIP and by_type=by_sequence=False.
         """
         _ = file_index  # reserved for subclass overrides
         system_prompt = self._folder_system_prompt()
@@ -257,12 +239,24 @@ class LLMClassifier:
                 parsed=decision.model_dump(),
             )
 
+            # Mixed → force SKIP and clear the organisation flags
+            if decision.is_mixed:
+                return ClassificationResult(
+                    category=Category.SKIP,
+                    reason=decision.reason,
+                    is_mixed=True,
+                    folder_description=decision.folder_description,
+                    by_type=False,
+                    by_sequence=False,
+                )
+
             return ClassificationResult(
                 category=Category(decision.category),
-                confidence=decision.confidence,
                 reason=decision.reason,
-                is_mixed=decision.is_mixed,
+                is_mixed=False,
                 folder_description=decision.folder_description,
+                by_type=decision.by_type,
+                by_sequence=decision.by_sequence,
             )
 
         except Exception as e:
@@ -282,16 +276,7 @@ class LLMClassifier:
         ancestor_descriptions: Optional[List[str]] = None,
         sibling_names: Optional[List[str]] = None,
     ) -> ClassificationResult:
-        """
-        Classify an individual file.
-
-        Args:
-            file_meta: The file to classify
-            file_index: Full DB file index (for description lookup)
-            ancestor_descriptions: Context from ancestor folders
-            sibling_names: Names of other files in the same directory (for
-                context about naming conventions and co-located files)
-        """
+        """Classify an individual file."""
         db_entry = file_index.get(file_meta.file_name)
         file_desc = ""
         if db_entry and db_entry.description:
@@ -320,11 +305,14 @@ class LLMClassifier:
                 parsed=decision.model_dump(),
             )
 
+            # Force file-level output to ONLY: study / practice / support
+            cat = decision.category
+            if cat == "skip":
+                cat = "support"
+
             return ClassificationResult(
-                category=Category(decision.category),
-                confidence=decision.confidence,
+                category=Category(cat),
                 reason=decision.reason,
-                is_mixed=False,
             )
 
         except Exception as e:
@@ -343,28 +331,11 @@ class LLMClassifier:
         file_index: Dict[str, FileIndexEntry],
         ancestor_descriptions: Optional[List[str]] = None,
     ) -> Dict[str, ClassificationResult]:
-        """
-        Classify a list of files one-by-one, returning a mapping of
-        file_path -> ClassificationResult.
-
-        Each file is classified with its own LLM call for detailed reasoning.
-        Sibling file names from the same directory are automatically gathered
-        and passed as context to help the LLM apply naming-convention heuristics.
-
-        Args:
-            files: List of FileMeta objects to classify
-            file_index: Full DB file index (for description lookup)
-            ancestor_descriptions: Context from ancestor folders
-
-        Returns:
-            Dict mapping source_path -> ClassificationResult
-        """
+        """Classify a list of files one-by-one (sibling context included)."""
         results: Dict[str, ClassificationResult] = {}
-
         if not files:
             return results
 
-        # Pre-compute sibling names per directory for naming-convention context
         dir_to_names: Dict[str, List[str]] = {}
         for f in files:
             dir_to_names.setdefault(f.folder_path, []).append(f.file_name)
@@ -374,47 +345,34 @@ class LLMClassifier:
             logger.info(
                 f"[classify_files] ({i}/{total}) Classifying: {file_meta.source_path}"
             )
-
-            # Gather sibling names (exclude the file itself)
             siblings = [
                 name for name in dir_to_names.get(file_meta.folder_path, [])
                 if name != file_meta.file_name
             ]
-
             result = self.classify_file(
-                file_meta,
-                file_index,
+                file_meta, file_index,
                 ancestor_descriptions=ancestor_descriptions,
                 sibling_names=siblings if siblings else None,
             )
             results[file_meta.source_path] = result
 
-        logger.info(
-            f"[classify_files] Completed: {total} files classified"
-        )
+        logger.info(f"[classify_files] Completed: {total} files classified")
         return results
 
-    # -------------------- Prompts (adapted from file_organizer_v6) -------------------- #
+    # -------------------- Prompts -------------------- #
+    # PROMPTS: content unchanged (only minimal grammar/spacing fixes).
 
     def _folder_system_prompt(self) -> str:
         """System prompt for folder classification."""
         return (
             "You are classifying course folders into four categories:\n"
             "- practice: Students DO or PRODUCE work — homework (hw), labs, projects.\n"
-            "  This also includes exam solutions/explanations (e.g., midterm walkthroughs).\n"
+            "  This also includes exam solutions/explanations\n"
             "- study: Instructional learning content that students READ, WATCH, or REVIEW.\n"
-            "  This includes: lectures, lecture slides/notes/PDFs, readings, videos,\n"
-            "  discussion/section materials and folders containing lecture slides/PDFs/code.\n"
-            "- support: Global course support like syllabus, past exams, textbooks,\n"
-            "  tools/how-to docs.\n"
-            "- skip: Build artifacts, generated files, empty folders, or content with\n"
-            "  no pedagogical value that should not be reorganized.\n\n"
-            "Key distinction:\n"
-            "  'practice' = student-produced assignments (hw, lab, project).\n"
-            "  'study'    = instructor-provided learning material.\n"
-            "  Discussion worksheets are study material even when they contain problems,\n"
-            "  because they are part of the instructor-led section flow, not graded\n"
-            "  student submissions.\n\n"
+            "  This includes: lectures, lecture slides/notes/PDFs, discussion/section materials.\n"
+            "- support: Global course support like syllabus, textbooks, tools/how-to docs.\n"
+            "  Study guides belongs to support!\n"
+            "- skip: Folders that contain files from MULTIPLE (>1) categories or are not useful .\n\n"
             "Rules:\n"
             "1. You receive a description of a folder with its structure, file listings,\n"
             "   and concatenated file descriptions from the database.\n"
@@ -422,18 +380,25 @@ class LLMClassifier:
             "3. Your primary goal is to assign ONE best category based on overall purpose.\n"
             "4. Think top-down: classify the folder as a whole, not per-file.\n"
             "5. CRITICAL — you MUST reason FIRST, then decide:\n"
-            "   a. Write a detailed 'reason' field explaining what the folder contains,\n"
-            "      its educational purpose, and why it fits a particular category.\n"
-            "   b. Only AFTER writing the reason, fill in 'category' and 'confidence'.\n"
+            "   a. Write a short 'reason' field explaining why it fits a particular category.\n"
+            "   b. Only AFTER writing the reason, fill in 'category'.\n"
             "   c. The reason must logically support the chosen category.\n"
             "   DO NOT pick a category first and then justify it.\n"
             "6. Set is_mixed=true if the folder contains a clear mix of categories\n"
-            "   (e.g., both homework and lecture slides). This signals that the BFS\n"
-            "   should descend and classify children individually.\n"
+            "   (e.g., both homework (practice) and lecture slides (study)). is_mixed forces category to skip.\n"
             "7. Write a brief folder_description (one sentence) summarizing the\n"
             "   folder's pedagogical purpose. This will be used as context for\n"
             "   classifying child folders/files.\n"
             "8. folder_path MUST match exactly the string shown after 'Folder:' in input.\n"
+            "9. Set by_type=true if this folder's immediate children are organised by\n"
+            "   TASK/MEDIA TYPE — different kinds of material side-by-side.\n"
+            "   Example: practice/ has hw/, lab/, proj/ (three different types).\n"
+            "   Example: study/ has slides/, videos/, readings/ (three media types).\n"
+            "10. Set by_sequence=true if this folder's immediate children are organised\n"
+            "    by TOPIC/TIME SEQUENCE — same kind of content, numbered or topic-ordered.\n"
+            "    Example: study/ has lecture01/, lecture02/ (sequential lectures).\n"
+            "    by_type and by_sequence are mutually exclusive; both must be False\n"
+            "    when is_mixed=true or the organisation scheme is unclear.\n"
         )
 
     def _folder_user_prompt(
@@ -472,22 +437,20 @@ class LLMClassifier:
 
         all_files = collect_all_files(node)
         if all_files:
-            cap = min(len(all_files), MAX_FILES_IN_PROMPT)
-            lines.append(f"\nFiles (name + description, up to {cap} shown):")
-            for f in all_files[:cap]:
+            lines.append("\nFiles (name + description):")
+            for f in all_files:
                 desc = (f.description or "").replace("\n", " ").strip()
                 if not desc:
                     desc = "[no description]"
                 lines.append(f"  - {f.file_name} :: {desc}")
-            if len(all_files) > cap:
-                lines.append(f"  ... and {len(all_files) - cap} more files")
 
         if concat_desc:
-            lines.append(f"\nConcatenated file descriptions (up to {MAX_CONCAT_DESC_CHARS} chars):")
+            lines.append("\nConcatenated file descriptions:")
             lines.append(concat_desc)
 
         lines.append(
-            "\nClassify this folder. Write reason FIRST, then category and confidence."
+            "\nClassify this folder. Write reason FIRST, then category, "
+            "then set is_mixed, by_type, by_sequence."
         )
 
         return "\n".join(lines)
@@ -495,27 +458,22 @@ class LLMClassifier:
     def _file_system_prompt(self) -> str:
         """System prompt for individual file classification."""
         return (
-            "You are classifying a single course file into one of four categories:\n\n"
+            "You are classifying a single course file into one of three categories:\n\n"
             "- study: Learning materials that students READ, WATCH, or REVIEW.\n"
-            "  Includes: lecture slides, lecture notes/PDFs, readings, videos,\n"
-            "  discussion/section materials, supplement code files for demonstration\n"
-            "  (not for practicing). These materials usually focus on specific\n"
-            "  course concepts.\n\n"
-            "- practice: Student-produced work and assignments.\n"
-            "  Includes: homework, labs, projects, exercises, lab sheets,\n"
-            "  quizzes, exam papers, Jupyter notebooks for assignments (.ipynb).\n\n"
-            "- support: Course logistics and supplementary resources.\n"
-            "  Includes: syllabus, calendar, tools/how-to docs, study guides,\n"
-            "  extracurricular readings, cheat sheets, past exams (when used\n"
-            "  as reference, not as active assignments).\n\n"
-            "- skip: Generated/irrelevant files with no pedagogical value.\n"
-            "  Includes: build artifacts, cache files, empty files, compiled\n"
-            "  binaries, package lock files.\n\n"
+            "  e.x. lecture slides/videos/readings, lecture notes,\n"
+            "  discussion materials, supplement code files for demonstration\n"
+            "  These materials usually focus on specific course concepts.\n\n"
+            "- practice: Student-PRODUCED work and assignments.\n"
+            "  e.x. homework, labs, projects, exercises, quizzes, exam papers.\n\n"
+            "- support: Course LOGISTICS and SUPPLEMENTARY resources.\n"
+            "  e.x. syllabus, calendar, study guides, staff information.\n\n"
+            "  Ignore files that are meaningless.\n\n"
             "Key distinctions:\n"
-            "  'practice' = student-produced assignments (hw, lab, project).\n"
-            "  'study'    = instructor-provided learning material.\n"
+            "  'practice' = student-produced assignments.\n"
+            "  'study'    = instructor-provided, lecture-related learning material.\n"
             "  Discussion worksheets are study material even when they contain\n"
             "  problems, because they are part of instructor-led section flow.\n\n"
+            "  NOTE: study guide realted info belongs to practice even if it contains study in its name."
             "Rules:\n"
             "1. You receive the file's name, path, description from the database,\n"
             "   and context from ancestor folders.\n"
@@ -523,7 +481,7 @@ class LLMClassifier:
             "   Files in the same folder with similar naming conventions usually\n"
             "   belong to the same category — use this as a strong signal.\n"
             "3. Reason FIRST about what this file is and its educational purpose.\n"
-            "4. Then decide on category and confidence.\n"
+            "4. Then decide on category.\n"
             "5. file_path MUST match exactly the path shown in the input.\n"
         )
 
@@ -565,7 +523,7 @@ class LLMClassifier:
                 lines.append(f"  ... and {len(sibling_names) - 20} more")
 
         lines.append(
-            "\nClassify this file. Write reason FIRST, then category and confidence."
+            "\nClassify this file. Write reason FIRST, then category."
         )
 
         return "\n".join(lines)

@@ -1,43 +1,35 @@
 #!/usr/bin/env python3
 """
-bfs_v2.py
+bfs_v3.py
 
-BFS-based File Reorganization Agent with LLM Classification and DB Integration.
+BFS-based File Reorganization Agent — v3.
 
-Pipeline:
-  1. Connect to SQLite DB (file.db) and load the complete file index
-  2. Scan the course directory and build a folder tree
-  3. BFS traversal from root, classifying folders top-down via classify_v1
-  4. When confident at folder level -> assign category to all contents
-  5. When low confidence or mixed -> descend to classify individual files
-  6. Produce file move mappings and a Markdown report
+python3 bfs_v3.py \
+  --source "/Users/runjiezhang/Desktop/CS 61A/61A_DB_ONLY_SKELETON/CS 61A_unstructured" \
+  --db "/Users/runjiezhang/Desktop/CS 61A/file.db" \
+  --model "gpt-5-mini-2025-08-07" \
+  --execute \
+  --dest "/Users/runjiezhang/Desktop/CS 61A/61A_reorganized_v3"
 
-Fixes implemented:
-  - FIX #1: Confident skip prunes subtree entirely
-  - FIX #2: folder_description written to DB only on confident assignment
-  - FIX #3: Combined reason + decide in 1 LLM call (in classify_v1)
-  - FIX #4: Visited set prevents duplicate processing
-  - FIX #5: top_level_folder() for file-level dest path
-  - FIX #6: Sync warnings between DB and disk
-  - FIX #7: Mappings keyed by source_rel (no duplicates)
-
-Output:
-  - bfs_v2_plan.json          — full reorganization plan
-  - bfs_v2_report.md          — human-readable report with LLM I/O and organized tree
-  - bfs_v2_llm_debug.json     — raw LLM debug log
+Edits:
+  - No MAX_ANCESTOR_DEPTH or truncation for concatenated descriptions
+  - Study destination has NO "lecture/" injection:
+      study/<top_folder>/<tail>
+  - Default model remains: gpt-5-mini-2025-08-07
+  - File classification outputs are only: study/practice/support (handled in classify_v3.py).
 """
 
 import json
 import logging
 import os
+import shutil
 import sqlite3
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Union
 
-# Import classifier and shared types from classify_v1
-from classify_v1 import (
+from classify_v3 import (
     LLMClassifier,
     Category,
     FileMeta,
@@ -45,9 +37,7 @@ from classify_v1 import (
     FileIndexEntry,
     FolderStats,
     ClassificationResult,
-    DEFAULT_CONFIDENCE_THRESHOLD,
     collect_all_files,
-    MAX_CONCAT_DESC_CHARS,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,11 +55,11 @@ HARD_SKIP_DIRS: Set[str] = {
     "build", "dist", ".eggs",
 }
 
-MAX_ANCESTOR_DEPTH = 10
 DEFAULT_DB_PATH = "file.db"
-LLM_DEBUG_LOG_FILE = "bfs_v2_llm_debug.json"
-REPORT_MD_FILE = "bfs_v2_report.md"
-PLAN_JSON_FILE = "bfs_v2_plan.json"
+LLM_DEBUG_LOG_FILE = "bfs_v3_llm_debug.json"
+REPORT_MD_FILE = "bfs_v3_report.md"
+PLAN_JSON_FILE = "bfs_v3_plan.json"
+TREE_JSON_FILE = "bfs_v3_tree.json"
 
 
 # ====================================================================
@@ -81,7 +71,6 @@ class Classification:
     """Final classification record."""
     path: str
     category: Category
-    confidence: float
     reason: str
     classified_at_level: str    # "folder" or "file"
     parent_folder: Optional[str] = None
@@ -104,9 +93,15 @@ class TraversalResult:
     classifications: Dict[str, Classification]
     folder_decisions: Dict[str, ClassificationResult]
     skipped_folders: List[str]
-    mappings: Dict[str, FileMapping]   # FIX #7: keyed by source_rel
+    mappings: Dict[str, FileMapping]    # keyed by source_rel
     files_classified_individually: int
     files_classified_via_folder: int
+    # Sync stats
+    files_on_disk_count: int = 0
+    files_missing_in_db: List[str] = field(default_factory=list)
+    files_stale_in_db: List[str] = field(default_factory=list)
+    # Tree root (for tree JSON export)
+    root_node: Optional[FolderNode] = None
 
 
 # ====================================================================
@@ -124,14 +119,12 @@ class CourseDB:
         self.conn: Optional[sqlite3.Connection] = None
 
     def connect(self) -> None:
-        """Open SQLite connection with validation."""
         if not os.path.exists(self.db_path):
             raise FileNotFoundError(f"Database not found: {self.db_path}")
 
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
 
-        # Validate schema
         try:
             cur = self.conn.cursor()
             cur.execute("SELECT uuid, file_name, description FROM file LIMIT 1")
@@ -159,7 +152,7 @@ class CourseDB:
         cur = conn.cursor()
         cur.execute(
             "SELECT uuid, file_name, description, original_path, "
-            "relative_path, extra_info FROM file"
+            "original_path, extra_info, file_hash FROM file"
         )
         rows = cur.fetchall()
 
@@ -167,7 +160,7 @@ class CourseDB:
         for r in rows:
             fname = r["file_name"] or ""
             if not fname:
-                rel = r["relative_path"] or ""
+                rel = r["original_path"] or ""
                 fname = os.path.basename(rel) if rel else ""
             if not fname:
                 continue
@@ -177,8 +170,8 @@ class CourseDB:
                 file_name=fname,
                 description=r["description"] or "",
                 original_path=r["original_path"],
-                relative_path=r["relative_path"],
-                extra_info=r["extra_info"],
+                extra_info=r["extra_info"] or "",
+                file_hash=r["file_hash"] or None,
             )
             if fname not in index:
                 index[fname] = entry
@@ -187,7 +180,6 @@ class CourseDB:
         return index
 
     def get_uuids_for_files(self, file_names: List[str]) -> List[str]:
-        """Look up UUIDs for a list of file names."""
         conn = self._ensure_connected()
         uuids: List[str] = []
         cur = conn.cursor()
@@ -203,14 +195,7 @@ class CourseDB:
     ) -> int:
         """
         Write folder_description into extra_info for all files with given UUIDs.
-
-        Handles extra_info that is:
-          - NULL / empty  -> create new dict
-          - a JSON object -> merge into it
-          - a JSON array (e.g. video transcripts) -> wrap in {"_original": ..., "folder_description": ...}
-          - unparseable   -> overwrite with new dict
-
-        FIX #2: Only called on confident folder-level assignment.
+        Only called on confident non-SKIP folder assignments.
         """
         conn = self._ensure_connected()
         cur = conn.cursor()
@@ -224,7 +209,6 @@ class CourseDB:
 
             raw = row["extra_info"]
 
-            # Build the new extra_info dict
             if not raw:
                 info = {}
             else:
@@ -236,7 +220,6 @@ class CourseDB:
                 if isinstance(parsed, dict):
                     info = parsed
                 elif isinstance(parsed, list):
-                    # Preserve the original list under _original
                     info = {"_original": parsed}
                 else:
                     info = {}
@@ -318,12 +301,14 @@ def build_tree(
 
         entry = file_index.get(fname)
         desc = entry.description if entry else None
+        fhash = entry.file_hash if entry else None
 
         node.files.append(FileMeta(
             source_path=rel_path,
             folder_path=folder,
             file_name=fname,
             description=desc,
+            file_hash=fhash,
         ))
 
     return root
@@ -359,12 +344,9 @@ def compute_folder_stats(node: FolderNode) -> FolderStats:
 def build_concat_desc(
     files: List[FileMeta],
     file_index: Dict[str, FileIndexEntry],
-    max_chars: int = MAX_CONCAT_DESC_CHARS,
 ) -> str:
-    """Build a concatenated description string, truncated to max_chars."""
+    """Build a concatenated description string (NO truncation)."""
     parts: List[str] = []
-    total = 0
-
     for f in files:
         entry = file_index.get(f.file_name)
         desc = ""
@@ -374,22 +356,12 @@ def build_concat_desc(
             desc = f.description.replace("\n", " ").strip()
         if not desc:
             continue
-
-        line = f"{f.file_name}: {desc}"
-        if total + len(line) > max_chars:
-            remaining = max_chars - total
-            if remaining > 20:
-                parts.append(line[:remaining] + "...")
-            parts.append(f"[truncated — {len(files) - len(parts)} more files]")
-            break
-        parts.append(line)
-        total += len(line) + 1
-
+        parts.append(f"{f.file_name}: {desc}")
     return "\n".join(parts)
 
 
 def top_level_folder(source_path: str) -> str:
-    """Extract top-level folder from a relative path. FIX #5."""
+    """Extract top-level folder from a relative path."""
     parts = source_path.replace("\\", "/").split("/")
     return parts[0] if len(parts) > 1 else ""
 
@@ -401,9 +373,8 @@ def build_dest_rel(category: str, top_folder: str, tail: str) -> str:
     if category == "support":
         return _join_rel("support", top_folder, tail)
     if category == "study":
-        if top_folder == "lecture":
-            return _join_rel("study", "lecture", tail)
-        return _join_rel("study", "lecture", top_folder, tail)
+        # IMPORTANT: no extra "lecture/" folder
+        return _join_rel("study", top_folder, tail)
     return _join_rel(top_folder, tail)
 
 
@@ -412,29 +383,31 @@ def _join_rel(*parts: str) -> str:
     return "/".join(clean)
 
 
-def log_sync_warnings(
+def compute_sync_stats(
     file_index: Dict[str, FileIndexEntry],
     files_on_disk: List[str],
-) -> None:
-    """FIX #6: Log warnings for DB/disk mismatches."""
+) -> tuple:
+    """Compute DB/disk mismatches and log warnings."""
     disk_filenames = {os.path.basename(f) for f in files_on_disk}
     db_filenames = set(file_index.keys())
 
-    missing_in_db = disk_filenames - db_filenames
-    stale_in_db = db_filenames - disk_filenames
+    missing_in_db = sorted(disk_filenames - db_filenames)
+    stale_in_db = sorted(db_filenames - disk_filenames)
 
     if missing_in_db:
         logger.warning(
             f"[SYNC] {len(missing_in_db)} files on disk have NO DB entry. "
-            f"Examples: {sorted(missing_in_db)[:5]}"
+            f"Examples: {missing_in_db[:5]}"
         )
     if stale_in_db:
         logger.warning(
             f"[SYNC] {len(stale_in_db)} DB entries have no file on disk. "
-            f"Examples: {sorted(stale_in_db)[:5]}"
+            f"Examples: {stale_in_db[:5]}"
         )
     if not missing_in_db and not stale_in_db:
         logger.info("[SYNC] DB and disk are fully in sync.")
+
+    return missing_in_db, stale_in_db
 
 
 # ====================================================================
@@ -442,17 +415,15 @@ def log_sync_warnings(
 # ====================================================================
 
 class BFSTraverser:
-    """Core BFS traversal engine implementing the t2c2spr pipeline."""
+    """Core BFS traversal engine."""
 
     def __init__(
         self,
         db: CourseDB,
         classifier: LLMClassifier,
-        confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     ):
         self.db = db
         self.classifier = classifier
-        self.confidence_threshold = confidence_threshold
 
     def traverse(
         self,
@@ -470,12 +441,17 @@ class BFSTraverser:
         files_on_disk = scan_directory(source_path, max_depth)
         logger.info(f"[BFS] Found {len(files_on_disk)} files on disk")
 
-        log_sync_warnings(file_index, files_on_disk)
+        missing_in_db, stale_in_db = compute_sync_stats(file_index, files_on_disk)
 
         root = build_tree(source_path, files_on_disk, file_index)
         logger.info(f"[BFS] Tree: {len(root.children)} top-level folders")
 
         result = self._bfs_classify(root, file_index)
+
+        result.files_on_disk_count = len(files_on_disk)
+        result.files_missing_in_db = missing_in_db
+        result.files_stale_in_db = stale_in_db
+        result.root_node = root  # Store for tree JSON export
 
         logger.info(
             f"[BFS] Done: {result.files_classified_via_folder} via folder, "
@@ -484,7 +460,7 @@ class BFSTraverser:
             f"{len(result.mappings)} mappings"
         )
 
-        self.classifier.save_debug_log()
+        self.classifier.save_debug_log(LLM_DEBUG_LOG_FILE)
         return result
 
     def _bfs_classify(
@@ -571,91 +547,97 @@ class BFSTraverser:
 
         logger.info(
             f"[BFS] Folder '{item.path}': {result.category.value} "
-            f"(conf={result.confidence:.2f}, mixed={result.is_mixed})"
+            f"(mixed={result.is_mixed})"
         )
 
+        # Accumulate ancestor context (NO depth cap)
         child_ancestors = list(my_ancestors)
-        if result.folder_description and len(child_ancestors) < MAX_ANCESTOR_DEPTH:
+        if result.folder_description:
             child_ancestors.append(result.folder_description)
 
-        # FIX #1: Confident skip -> prune subtree
-        if (
-            result.category == Category.SKIP
-            and result.confidence >= self.confidence_threshold
-        ):
+        # SKIP: always descend
+        if result.category == Category.SKIP:
             skipped_folders.append(item.path)
             classifications[item.path] = Classification(
                 path=item.path,
                 category=Category.SKIP,
-                confidence=result.confidence,
                 reason=result.reason,
                 classified_at_level="folder",
                 ancestor_descriptions=list(my_ancestors),
             )
-            logger.info(f"[BFS]   -> Confident SKIP, pruning subtree")
-            return
-
-        should_descend = (
-            not result.is_confident(self.confidence_threshold)
-            or result.is_mixed
-        )
-
-        if result.category == Category.SKIP:
-            skipped_folders.append(item.path)
-            should_descend = True
-
-        descent_note = " [descended]" if should_descend else ""
-        classifications[item.path] = Classification(
-            path=item.path,
-            category=result.category,
-            confidence=result.confidence,
-            reason=result.reason + descent_note,
-            classified_at_level="folder",
-            ancestor_descriptions=list(my_ancestors),
-        )
-
-        if should_descend:
-            logger.info(f"[BFS]   -> Descending into '{item.path}'")
+            logger.info(
+                f"[BFS]   -> SKIP, descending with {len(child_ancestors)} parent-level context entries"
+            )
             for child in item.children.values():
                 ancestor_desc_map[child.path] = child_ancestors
                 task_queue.append(child)
             ancestor_desc_map[item.path] = child_ancestors
             for f in item.files:
                 task_queue.append(f)
-        else:
-            logger.info(f"[BFS]   -> Confident, assigning {len(folder_files)} files")
+            return
 
-            # FIX #2: Write to DB only on confident assignment
-            if result.folder_description:
-                file_names = [f.file_name for f in folder_files]
-                uuids = self.db.get_uuids_for_files(file_names)
-                if uuids:
-                    self.db.update_folder_description_bulk(uuids, result.folder_description)
+        # Mixed: treat like SKIP (descend, no DB write)
+        if result.is_mixed:
+            skipped_folders.append(item.path)
+            classifications[item.path] = Classification(
+                path=item.path,
+                category=result.category,
+                reason=result.reason + " [mixed→skip, descended]",
+                classified_at_level="folder",
+                ancestor_descriptions=list(my_ancestors),
+            )
+            logger.info(
+                f"[BFS]   -> Mixed, descending with {len(child_ancestors)} parent-level context entries"
+            )
+            for child in item.children.values():
+                ancestor_desc_map[child.path] = child_ancestors
+                task_queue.append(child)
+            ancestor_desc_map[item.path] = child_ancestors
+            for f in item.files:
+                task_queue.append(f)
+            return
 
-            for f in folder_files:
-                classifications[f.source_path] = Classification(
-                    path=f.source_path,
-                    category=result.category,
-                    confidence=result.confidence,
-                    reason=f"Inherited from folder '{item.path}': {result.reason}",
-                    classified_at_level="folder",
-                    parent_folder=item.path,
-                    ancestor_descriptions=list(child_ancestors),
-                )
+        # Non-SKIP, non-mixed: assign folder directly
+        classifications[item.path] = Classification(
+            path=item.path,
+            category=result.category,
+            reason=result.reason,
+            classified_at_level="folder",
+            ancestor_descriptions=list(my_ancestors),
+        )
 
-                top = top_level_folder(f.source_path)
-                tail = f.source_path
-                if top:
-                    tail = f.source_path[len(top):].lstrip("/")
-                dest_rel = build_dest_rel(result.category.value, top, tail)
+        logger.info(f"[BFS]   -> Assigning {len(folder_files)} files directly")
 
-                mappings[f.source_path] = FileMapping(
-                    source_rel=f.source_path,
-                    dest_rel=dest_rel,
-                    top_folder=top,
-                    category=result.category.value,
-                    reason=result.reason,
-                )
+        # Write to DB only on confident non-SKIP assignment
+        if result.folder_description:
+            file_names = [f.file_name for f in folder_files]
+            uuids = self.db.get_uuids_for_files(file_names)
+            if uuids:
+                self.db.update_folder_description_bulk(uuids, result.folder_description)
+
+        for f in folder_files:
+            classifications[f.source_path] = Classification(
+                path=f.source_path,
+                category=result.category,
+                reason=f"Inherited from folder '{item.path}': {result.reason}",
+                classified_at_level="folder",
+                parent_folder=item.path,
+                ancestor_descriptions=list(child_ancestors),
+            )
+
+            top = top_level_folder(f.source_path)
+            tail = f.source_path
+            if top:
+                tail = f.source_path[len(top):].lstrip("/")
+            dest_rel = build_dest_rel(result.category.value, top, tail)
+
+            mappings[f.source_path] = FileMapping(
+                source_rel=f.source_path,
+                dest_rel=dest_rel,
+                top_folder=top,
+                category=result.category.value,
+                reason=result.reason,
+            )
 
     def _process_file(
         self,
@@ -673,17 +655,13 @@ class BFSTraverser:
         )
 
         logger.info(
-            f"[BFS] File '{item.source_path}': {result.category.value} "
-            f"(conf={result.confidence:.2f})"
+            f"[BFS] File '{item.source_path}': {result.category.value}"
         )
 
-        if result.category == Category.SKIP:
-            return
-
+        # classify_v3 guarantees file category is only study/practice/support
         classifications[item.source_path] = Classification(
             path=item.source_path,
             category=result.category,
-            confidence=result.confidence,
             reason=result.reason,
             classified_at_level="file",
             ancestor_descriptions=list(file_ancestors),
@@ -705,186 +683,320 @@ class BFSTraverser:
 
 
 # ====================================================================
+#  Tree JSON Export
+# ====================================================================
+
+def _build_class_tree(
+    node: FolderNode,
+    classifications: Dict[str, Classification],
+    folder_decisions: Dict[str, ClassificationResult],
+) -> dict:
+    node_dict: dict = {
+        "path": node.path,
+        "name": node.name,
+        "type": "folder",
+    }
+
+    fd = folder_decisions.get(node.path)
+    if fd:
+        node_dict["category"] = fd.category.value
+        node_dict["is_mixed"] = fd.is_mixed
+        node_dict["folder_description"] = fd.folder_description
+        node_dict["by_type"] = fd.by_type
+        node_dict["by_sequence"] = fd.by_sequence
+
+    files_dict: dict = {}
+    for f in node.files:
+        fc = classifications.get(f.source_path)
+        entry: dict = {
+            "path": f.source_path,
+            "name": f.file_name,
+            "type": "file",
+            "file_hash": f.file_hash,
+        }
+        if fc:
+            entry["category"] = fc.category.value
+            entry["classified_by"] = fc.classified_at_level
+        key = f.file_hash if f.file_hash else f.source_path
+        files_dict[key] = entry
+    if files_dict:
+        node_dict["files"] = files_dict
+
+    if node.children:
+        node_dict["children"] = {
+            child_name: _build_class_tree(child_node, classifications, folder_decisions)
+            for child_name, child_node in sorted(node.children.items())
+        }
+
+    return node_dict
+
+
+def export_tree_json(
+    result: TraversalResult,
+    out_path: str = TREE_JSON_FILE,
+) -> None:
+    if result.root_node is None:
+        logger.warning("[TREE] root_node is None — skipping tree JSON export")
+        return
+
+    tree = _build_class_tree(
+        result.root_node,
+        result.classifications,
+        result.folder_decisions,
+    )
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(tree, f, ensure_ascii=False, indent=2)
+
+    print(f"Exported classification tree to {out_path}")
+
+
+# ====================================================================
+#  Execute Moves
+# ====================================================================
+
+def execute_moves(
+    result: TraversalResult,
+    source_dir: str,
+    dest_dir: str,
+) -> int:
+    """
+    Copy files from source_dir to dest_dir according to the reorganization plan.
+
+    The original source_dir is left untouched.
+    Unmapped (SKIP) files are not copied.
+    """
+    source_dir = os.path.abspath(source_dir)
+    dest_dir = os.path.abspath(dest_dir)
+
+    if dest_dir == source_dir or dest_dir.startswith(source_dir + os.sep):
+        raise ValueError(
+            f"dest_dir ({dest_dir}) must not be inside source_dir ({source_dir})"
+        )
+
+    logger.info(f"[EXEC] Copying {len(result.mappings)} files to {dest_dir}")
+    copied = 0
+    skipped = 0
+
+    for mapping in result.mappings.values():
+        src = os.path.join(source_dir, mapping.source_rel)
+        dst = os.path.join(dest_dir, mapping.dest_rel)
+
+        if not os.path.exists(src):
+            logger.warning(f"[EXEC] Source not found, skipping: {src}")
+            skipped += 1
+            continue
+
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        copied += 1
+
+    logger.info(f"[EXEC] Done: {copied} copied, {skipped} skipped")
+    print(f"Copied {copied} files -> {dest_dir}  ({skipped} source files missing)")
+    return copied
+
+
+# ====================================================================
 #  Markdown Report Generator
 # ====================================================================
+
+def _build_dest_tree(result: TraversalResult) -> dict:
+    tree: dict = {}
+    for m in result.mappings.values():
+        parts = m.dest_rel.split("/")
+        cur = tree
+        for p in parts[:-1]:
+            cur = cur.setdefault(p, {})
+        cur.setdefault("__files__", []).append(parts[-1])
+    return tree
+
+
+def _count_tree_files(node: dict) -> int:
+    count = len(node.get("__files__", []))
+    for k, v in node.items():
+        if k != "__files__":
+            count += _count_tree_files(v)
+    return count
+
+
+def _render_dest_tree(node: dict, lines: List[str], indent: int, max_depth: int = 4) -> None:
+    pad = "  " * indent
+
+    for key in sorted(k for k in node if k != "__files__"):
+        child = node[key]
+        n_files = _count_tree_files(child)
+        lines.append(f"{pad}{key}/  ({n_files} files)")
+        if indent < max_depth:
+            _render_dest_tree(child, lines, indent + 1, max_depth)
+
+    files = node.get("__files__", [])
+    if files and indent >= max_depth:
+        lines.append(f"{pad}  ... {len(files)} files")
+    elif files and len(files) <= 10:
+        for fn in sorted(files):
+            lines.append(f"{pad}  {fn}")
+    elif files:
+        for fn in sorted(files)[:5]:
+            lines.append(f"{pad}  {fn}")
+        lines.append(f"{pad}  ... and {len(files) - 5} more")
+
 
 def generate_report(
     result: TraversalResult,
     classifier: LLMClassifier,
     out_path: str = REPORT_MD_FILE,
 ) -> None:
-    """
-    Generate a comprehensive Markdown report including:
-      1. Summary statistics
-      2. Folder decisions table (with LLM reasoning)
-      3. LLM input/output log for each classification call
-      4. Organized destination tree
-      5. Full file mapping table
-    """
     lines: List[str] = []
 
-    # --- Header ---
-    lines.append("# BFS v2 — Reorganization Report\n")
+    lines.append("# BFS v3 — Reorganization Report\n")
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-    # --- 1. Summary ---
     lines.append("## 1. Summary\n")
     cat_counts: Dict[str, int] = {}
     for c in result.classifications.values():
         cat_counts[c.category.value] = cat_counts.get(c.category.value, 0) + 1
 
     lines.append("| Metric | Value |")
-    lines.append("|--------|-------|")
+    lines.append("|--------|------:|")
+    lines.append(f"| Files on disk | {result.files_on_disk_count} |")
     for cat in ["study", "practice", "support", "skip"]:
-        lines.append(f"| {cat} items | {cat_counts.get(cat, 0)} |")
-    lines.append(f"| Files via folder | {result.files_classified_via_folder} |")
-    lines.append(f"| Files individually | {result.files_classified_individually} |")
-    lines.append(f"| Skipped folders | {len(result.skipped_folders)} |")
-    lines.append(f"| Total mappings | {len(result.mappings)} |")
+        lines.append(f"| Classified as **{cat}** | {cat_counts.get(cat, 0)} |")
+    lines.append(f"| Files classified via folder | {result.files_classified_via_folder} |")
+    lines.append(f"| Files classified individually | {result.files_classified_individually} |")
+    lines.append(f"| Total file mappings | {len(result.mappings)} |")
+    lines.append(f"| Skipped folders (still descended) | {len(result.skipped_folders)} |")
+    lines.append(f"| Files not in DB | {len(result.files_missing_in_db)} |")
+    lines.append(f"| Stale DB entries (no file) | {len(result.files_stale_in_db)} |")
+    lines.append(f"| LLM calls | {len(classifier.debug_log)} |")
     lines.append("")
 
-    # --- 2. Folder Decisions ---
     lines.append("## 2. Folder Decisions\n")
-    lines.append("| Folder | Category | Confidence | Mixed | Description |")
-    lines.append("|--------|----------|------------|-------|-------------|")
+    lines.append("| Folder | Category | Mixed | Reason | Description |")
+    lines.append("|--------|----------|:-----:|--------|-------------|")
     for path, dec in sorted(result.folder_decisions.items()):
-        desc_short = (dec.folder_description or "—")[:60]
+        desc_short = (dec.folder_description or "")[:100]
+        reason_short = (dec.reason or "")[:120]
+        mixed = "Y" if dec.is_mixed else ""
         lines.append(
-            f"| `{path}` | **{dec.category.value}** | {dec.confidence:.2f} "
-            f"| {'yes' if dec.is_mixed else 'no'} | {desc_short} |"
+            f"| `{path}` | {dec.category.value} | {mixed} | {reason_short} | {desc_short} |"
         )
     lines.append("")
 
-    # --- 3. Folder Reasoning Details ---
-    lines.append("## 3. Folder Classification Details\n")
-    for path, dec in sorted(result.folder_decisions.items()):
-        lines.append(f"### `{path}` — {dec.category.value} ({dec.confidence:.2f})\n")
-        if dec.folder_description:
-            lines.append(f"**Summary:** {dec.folder_description}\n")
-        lines.append("**LLM Reasoning:**")
-        lines.append("```")
-        lines.append(dec.reason)
-        lines.append("```")
-        lines.append("")
-
-    # --- 4. LLM Input/Output Log ---
-    lines.append("## 4. LLM Call Log\n")
-    lines.append(f"Total LLM calls: {len(classifier.debug_log)}\n")
-
-    for i, entry in enumerate(classifier.debug_log):
-        call_type = entry.get("call_type", "unknown")
-        timestamp = entry.get("timestamp", "")
-        lines.append(f"### Call {i + 1}: {call_type} ({timestamp})\n")
-
-        lines.append("<details>")
-        lines.append(f"<summary>System Prompt ({len(entry.get('system_prompt', ''))} chars)</summary>\n")
-        lines.append("```")
-        lines.append(entry.get("system_prompt", ""))
-        lines.append("```")
-        lines.append("</details>\n")
-
-        lines.append("<details>")
-        lines.append(f"<summary>User Prompt ({len(entry.get('user_prompt', ''))} chars)</summary>\n")
-        lines.append("```")
-        lines.append(entry.get("user_prompt", ""))
-        lines.append("```")
-        lines.append("</details>\n")
-
-        parsed = entry.get("parsed_output")
-        if parsed:
-            lines.append("<details>")
-            lines.append("<summary>Parsed Output</summary>\n")
-            lines.append("```json")
-            lines.append(json.dumps(parsed, indent=2, ensure_ascii=False))
-            lines.append("```")
-            lines.append("</details>\n")
-
-        error = entry.get("error")
-        if error:
-            lines.append(f"**ERROR:** `{error}`\n")
-
-        lines.append("")
-
-    # --- 5. Organized Destination Tree ---
-    lines.append("## 5. Organized Destination Tree\n")
-
-    # Build tree structure from mappings
-    dest_tree: dict = {}
-    for m in result.mappings.values():
-        parts = m.dest_rel.split("/")
-        cur = dest_tree
-        for p in parts[:-1]:
-            cur = cur.setdefault(p, {})
-        cur.setdefault("__files__", []).append(parts[-1])
-
+    lines.append("## 3. Destination Tree\n")
+    dest_tree = _build_dest_tree(result)
     lines.append("```")
     _render_dest_tree(dest_tree, lines, indent=0)
     lines.append("```")
     lines.append("")
 
-    # --- 6. Full Mapping Table ---
-    lines.append("## 6. File Mappings\n")
-    lines.append("| Source | Destination | Category |")
-    lines.append("|--------|-------------|----------|")
-    for _, m in sorted(result.mappings.items()):
-        lines.append(f"| `{m.source_rel}` | `{m.dest_rel}` | {m.category} |")
-    lines.append("")
-
-    # --- 7. Skipped Folders ---
     if result.skipped_folders:
-        lines.append("## 7. Skipped Folders\n")
+        lines.append("## 4. Skipped Folders (descended, not pruned)\n")
         for folder in sorted(result.skipped_folders):
             dec = result.folder_decisions.get(folder)
-            reason = dec.reason[:100] + "..." if dec and len(dec.reason) > 100 else (dec.reason if dec else "—")
-            lines.append(f"- `{folder}`: {reason}")
+            reason = (dec.reason[:300] + "...") if dec and len(dec.reason) > 300 else (dec.reason if dec else "")
+            lines.append(f"- `{folder}` — {reason}")
         lines.append("")
 
-    # Write file
+    if result.files_missing_in_db:
+        lines.append("## 5. Files Not Found in DB\n")
+        lines.append(f"{len(result.files_missing_in_db)} files on disk have no matching DB entry ")
+        lines.append("(classified without descriptions):\n")
+        shown = result.files_missing_in_db[:30]
+        for fn in shown:
+            lines.append(f"- `{fn}`")
+        if len(result.files_missing_in_db) > 30:
+            lines.append(f"- ... and {len(result.files_missing_in_db) - 30} more")
+        lines.append("")
+
+    if result.files_stale_in_db:
+        lines.append("## 6. Stale DB Entries\n")
+        lines.append(f"{len(result.files_stale_in_db)} DB entries have no corresponding file on disk:\n")
+        shown = result.files_stale_in_db[:30]
+        for fn in shown:
+            lines.append(f"- `{fn}`")
+        if len(result.files_stale_in_db) > 30:
+            lines.append(f"- ... and {len(result.files_stale_in_db) - 30} more")
+        lines.append("")
+
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    print(f"Report saved to {out_path}")
-
-
-def _render_dest_tree(node: dict, lines: List[str], indent: int) -> None:
-    """Render a nested dict as an indented tree."""
-    pad = "  " * indent
-
-    # Render files first
-    files = node.get("__files__", [])
-    for fn in sorted(files):
-        lines.append(f"{pad}{fn}")
-
-    # Render subdirectories
-    for key in sorted(k for k in node if k != "__files__"):
-        lines.append(f"{pad}{key}/")
-        _render_dest_tree(node[key], lines, indent + 1)
+    print(f"Report saved to {out_path} ({len(lines)} lines)")
 
 
 # ====================================================================
 #  Convenience Wrappers
 # ====================================================================
 
+def _tree_to_serializable(node: dict) -> dict:
+    out: dict = {}
+    files = node.get("__files__", [])
+    if files:
+        out["_files"] = sorted(files)
+    for key in sorted(k for k in node if k != "__files__"):
+        out[key] = _tree_to_serializable(node[key])
+    return out
+
+
+def export_mappings_json(result: TraversalResult, out_path: str = PLAN_JSON_FILE) -> None:
+    dest_tree = _build_dest_tree(result)
+
+    payload = {
+        "stats": {
+            "files_on_disk": result.files_on_disk_count,
+            "files_via_folder": result.files_classified_via_folder,
+            "files_individual": result.files_classified_individually,
+            "total_mappings": len(result.mappings),
+            "skipped_folders": len(result.skipped_folders),
+            "files_missing_in_db": len(result.files_missing_in_db),
+            "files_stale_in_db": len(result.files_stale_in_db),
+        },
+        "folder_decisions": {
+            path: {
+                "category": dec.category.value,
+                "is_mixed": dec.is_mixed,
+                "folder_description": dec.folder_description,
+                "by_type": dec.by_type,
+                "by_sequence": dec.by_sequence,
+            }
+            for path, dec in result.folder_decisions.items()
+        },
+        "dest_tree": _tree_to_serializable(dest_tree),
+        "mappings": [
+            {"source": m.source_rel, "dest": m.dest_rel, "category": m.category}
+            for m in result.mappings.values()
+        ],
+        "skipped_folders": result.skipped_folders,
+        "files_missing_in_db": result.files_missing_in_db,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"Exported plan to {out_path}")
+
+
 def bfs_reorganize(
     course_root: str,
     db_path: str = DEFAULT_DB_PATH,
-    model: str = "gpt-4.1-2025-04-14",
-    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    model: str = "gpt-5-mini-2025-08-07",
     report_path: str = REPORT_MD_FILE,
     json_path: str = PLAN_JSON_FILE,
+    tree_path: str = TREE_JSON_FILE,
+    dest_dir: Optional[str] = None,
 ) -> TraversalResult:
-    """One-call convenience function for the full pipeline."""
     db = CourseDB(db_path)
     db.connect()
 
     try:
         classifier = LLMClassifier(model=model)
-        traverser = BFSTraverser(db, classifier, confidence_threshold)
+        traverser = BFSTraverser(db, classifier)
         result = traverser.traverse(course_root)
 
-        # Generate outputs
         generate_report(result, classifier, report_path)
         export_mappings_json(result, json_path)
+        export_tree_json(result, tree_path)
+
+        if dest_dir:
+            execute_moves(result, course_root, dest_dir)
     finally:
         db.close()
 
@@ -892,9 +1004,8 @@ def bfs_reorganize(
 
 
 def print_classification_summary(result: TraversalResult) -> None:
-    """Print a human-readable summary to stdout."""
     print("\n" + "=" * 70)
-    print("BFS v2 — CLASSIFICATION SUMMARY")
+    print("BFS v3 — CLASSIFICATION SUMMARY")
     print("=" * 70)
 
     cat_counts: Dict[str, int] = {}
@@ -909,38 +1020,12 @@ def print_classification_summary(result: TraversalResult) -> None:
     print(f"  Via folder:     {result.files_classified_via_folder}")
     print(f"  Individually:   {result.files_classified_individually}")
 
-    print(f"\nSkipped Folders ({len(result.skipped_folders)}):")
+    print(f"\nSkipped Folders ({len(result.skipped_folders)}) — all descended:")
     for folder in result.skipped_folders:
         print(f"  - {folder}")
 
     print(f"\nFile Mappings: {len(result.mappings)}")
     print("=" * 70)
-
-
-def export_mappings_json(result: TraversalResult, out_path: str) -> None:
-    """Export mappings to a JSON file."""
-    payload = {
-        "folder_decisions": {
-            path: {
-                "category": dec.category.value,
-                "confidence": dec.confidence,
-                "reason": dec.reason,
-                "is_mixed": dec.is_mixed,
-                "folder_description": dec.folder_description,
-            }
-            for path, dec in result.folder_decisions.items()
-        },
-        "skipped_folders": result.skipped_folders,
-        "mappings": [asdict(m) for m in result.mappings.values()],
-        "stats": {
-            "files_via_folder": result.files_classified_via_folder,
-            "files_individual": result.files_classified_individually,
-            "total_mappings": len(result.mappings),
-        },
-    }
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"Exported plan to {out_path}")
 
 
 # ====================================================================
@@ -958,23 +1043,34 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description="BFS v2 — Course File Reorganization Agent",
+        description="BFS v3 — Course File Reorganization Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python bfs_v2.py --source ./course --db ./file.db\n"
-            "  python bfs_v2.py -s ./course -d ./file.db --model gpt-4.1-2025-04-14\n"
+            "  # Classify only (no file copies):\n"
+            "  python bfs_v3.py --source ./61A --db ./file.db\n\n"
+            "  # Classify + copy into a new folder (original untouched):\n"
+            "  python bfs_v3.py --source ./61A --db ./file.db "
+            "--execute --dest ./61A_reorganized\n"
         ),
     )
     parser.add_argument("--source", "-s", required=True, help="Course root directory")
-    parser.add_argument("--db", "-d", default=DEFAULT_DB_PATH, help=f"SQLite database path (default: {DEFAULT_DB_PATH})")
-    parser.add_argument("--model", default="gpt-4.1-2025-04-14", help="OpenAI model")
     parser.add_argument(
-        "--threshold", "-t", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD,
-        help=f"Confidence threshold (default: {DEFAULT_CONFIDENCE_THRESHOLD})",
+        "--db", "-d", default=DEFAULT_DB_PATH,
+        help=f"SQLite database path (default: {DEFAULT_DB_PATH})"
     )
-    parser.add_argument("--json-out", default=PLAN_JSON_FILE, help="JSON output file")
+    parser.add_argument("--model", default="gpt-5-mini-2025-08-07", help="OpenAI model")
+    parser.add_argument("--json-out", default=PLAN_JSON_FILE, help="Plan JSON output file")
+    parser.add_argument("--tree-out", default=TREE_JSON_FILE, help="Tree JSON output file for evaluation")
     parser.add_argument("--report", default=REPORT_MD_FILE, help="Markdown report output file")
+    parser.add_argument(
+        "--execute", action="store_true",
+        help="Actually copy files to --dest (original source is kept intact)"
+    )
+    parser.add_argument(
+        "--dest",
+        help="Destination directory for reorganized files (required when --execute is set)"
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
 
     args = parser.parse_args()
@@ -984,27 +1080,37 @@ def main():
         print(f"Error: directory not found: {source}")
         sys.exit(1)
 
+    if args.execute and not args.dest:
+        print("Error: --dest is required when --execute is set")
+        sys.exit(1)
+
     if not os.environ.get("OPENAI_API_KEY"):
         print("Error: OPENAI_API_KEY not set")
         sys.exit(1)
 
     print("=" * 70)
-    print("BFS v2 — Course File Reorganization Agent")
+    print("BFS v3 — Course File Reorganization Agent")
     print("=" * 70)
     print(f"Source:    {source}")
     print(f"DB:        {args.db}")
     print(f"Model:     {args.model}")
-    print(f"Threshold: {args.threshold}")
+    print(f"Plan:      {args.json_out}")
+    print(f"Tree:      {args.tree_out}")
     print(f"Report:    {args.report}")
+    if args.execute:
+        print(f"Execute:   YES  ->  {args.dest}")
+    else:
+        print("Execute:   NO (dry-run — use --execute --dest <dir> to copy files)")
     print("=" * 70)
 
     result = bfs_reorganize(
         course_root=source,
         db_path=args.db,
         model=args.model,
-        confidence_threshold=args.threshold,
         report_path=args.report,
         json_path=args.json_out,
+        tree_path=args.tree_out,
+        dest_dir=args.dest if args.execute else None,
     )
 
     print_classification_summary(result)
