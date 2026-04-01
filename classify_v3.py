@@ -103,6 +103,9 @@ class ClassificationResult:
     # Folder organisation scheme (folders only; both False for files/SKIP/mixed)
     by_type: bool = False
     by_sequence: bool = False
+    # Task/sequence names derived structurally or by LLM re-categorization
+    task_name: Optional[str] = None
+    sequence_name: Optional[str] = None
 
 
 # ====================================================================
@@ -164,6 +167,20 @@ class LLMFileDecision(BaseModel):
     )
     # Allow skip in parsing to avoid hard failures, but we force output to 3-way later.
     category: str = Field(..., pattern="^(practice|study|support|skip)$")
+
+
+class LLMTaskNameInference(BaseModel):
+    """LLM output for inferring a task name for a file/folder missing one."""
+    source_path: str = Field(..., description="Exact source path from input")
+    task_name: str = Field(
+        ...,
+        description=(
+            "The best matching task name from the provided known_task_names set. "
+            "If none match well, choose the closest or propose a short new name "
+            "like 'hw', 'lab', 'lecture', 'discussion', 'project', 'exam'."
+        ),
+    )
+    reason: str = Field(..., min_length=5, description="Why this task name fits.")
 
 
 # ====================================================================
@@ -358,6 +375,81 @@ class LLMClassifier:
 
         logger.info(f"[classify_files] Completed: {total} files classified")
         return results
+
+    # -------------------- Task Name Inference -------------------- #
+
+    def infer_task_name(
+        self,
+        source_path: str,
+        category: str,
+        description: str,
+        known_task_names: List[str],
+        ancestor_descriptions: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """
+        Given a file/folder with no identified task name, infer the best
+        matching task name from the provided set of known task names.
+        Returns the inferred task_name string, or None on failure.
+        """
+        known_sorted = sorted(known_task_names)
+        known_str = ", ".join(f'"{n}"' for n in known_sorted) if known_sorted else "(none known yet)"
+
+        system_prompt = (
+            "You are helping to organize course files by assigning each file a task name.\n"
+            "A task name identifies the type of educational task the file belongs to, "
+            "e.g. 'hw', 'lab', 'proj', 'lecture', 'discussion', 'exam', 'quiz'.\n\n"
+            "You will receive:\n"
+            "  - The file/folder path\n"
+            "  - Its category (study / practice / support)\n"
+            "  - Its description (if available)\n"
+            "  - Ancestor folder context\n"
+            "  - A set of known task names already identified in this course\n\n"
+            "Rules:\n"
+            "1. Prefer matching a name from the known_task_names set when it fits.\n"
+            "2. If none fit, propose a short lowercase task name (e.g. 'reading', 'quiz').\n"
+            "3. Reason FIRST, then fill task_name.\n"
+            "4. source_path MUST match exactly the path shown in the input.\n"
+        )
+
+        lines: List[str] = []
+        if ancestor_descriptions:
+            lines.append("Ancestor context (root -> parent):")
+            for i, desc in enumerate(ancestor_descriptions):
+                lines.append(f"  [{i}] {desc}")
+            lines.append("")
+
+        lines.append(f"Path: {source_path}")
+        lines.append(f"Category: {category}")
+        lines.append(f"Description: {description or '[none]'}")
+        lines.append(f"Known task names: {known_str}")
+        lines.append("\nInfer the task name. Reason FIRST, then fill task_name.")
+        user_prompt = "\n".join(lines)
+
+        try:
+            resp = self.client.responses.parse(
+                model=self.model,
+                instructions=system_prompt,
+                input=[{"role": "user", "content": user_prompt}],
+                text_format=LLMTaskNameInference,
+            )
+            decision: LLMTaskNameInference = resp.output_parsed
+
+            self._log_call(
+                "task_name_inference",
+                system_prompt, user_prompt,
+                raw=str(resp),
+                parsed=decision.model_dump(),
+            )
+            return decision.task_name
+
+        except Exception as e:
+            self._log_call(
+                "task_name_inference",
+                system_prompt, user_prompt,
+                error=str(e),
+            )
+            logger.warning(f"[LLM] infer_task_name failed for {source_path}: {e}")
+            return None
 
     # -------------------- Prompts -------------------- #
     # PROMPTS: content unchanged (only minimal grammar/spacing fixes).
