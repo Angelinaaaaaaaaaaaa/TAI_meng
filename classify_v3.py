@@ -460,7 +460,7 @@ class LLMClassifier:
             "- study: Instructor-provided learning materials that students READ, WATCH, or REVIEW.\n"
             "  Examples: lecture slides/videos/readings used for lecture delivery, lecture notes,\n"
             "  discussion/section/tutorial worksheets and handouts, and demo code used for teaching.\n\n"
-            "- practice: Student-produced assignments and graded work.\n"
+            "- practice: Student-facing task and deliverable materials, including work students are expected to complete, submit, or follow.\n"
             "  Examples: homework, labs, projects, exercises, quizzes, exams, and their assignment/exam solution sets.\n\n"
             "- support: Course logistics and reference resources.\n"
             "  Examples: syllabus, calendar, policies, staff info, tooling/how-to docs, study guides,\n"
@@ -477,10 +477,15 @@ class LLMClassifier:
             "1. You receive the file's name, path, description from the database,\n"
             "   and context from ancestor folders.\n"
             "2. You may also receive a list of sibling files in the same directory.\n"
-            "   Files in the same folder with similar naming conventions usually belong to the same category.\n"
-            "3. Reason FIRST about what this file is and its educational purpose.\n"
-            "4. Then decide on category.\n"
-            "5. file_path MUST match exactly the path shown in the input.\n"
+            "   Maintain ORGANIZATIONAL CONSISTENCY: if files form a clear series or pedagogical unit\n"
+            "   (e.g., lab1/lab2/lab3, proj1a/proj1b, disc01/disc02, hw1/hw2), prefer assigning the SAME\n"
+            "   category to the whole series so the reorganized repository is intuitive to students.\n"
+            "3. Favor grouping related materials for the same assignment/lab/project/discussion together,\n"
+            "   even if one file is slightly more instructional and another is slightly more task-oriented.\n"
+            "4. Only split same-series files across categories when one file is clearly a global logistics or\n"
+            "   reference resource unrelated to the pedagogical unit.\n"
+            "5. Reason FIRST about what this file is and its educational purpose.\n"
+            "6. Then decide on category.\n"
         )
 
     def _file_user_prompt(
@@ -520,6 +525,9 @@ class LLMClassifier:
             if len(sibling_names) > 20:
                 lines.append(f"  ... and {len(sibling_names) - 20} more")
 
+        lines.append("\nReorganization preference:")
+        lines.append("  - Keep same-series sibling files in one category when possible.")
+        lines.append("  - Favor intuitive grouping over narrow semantic differences.")
         lines.append(
             "\nClassify this file. Write reason FIRST, then category."
         )
