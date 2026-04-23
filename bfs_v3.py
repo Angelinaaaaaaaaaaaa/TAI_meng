@@ -11,12 +11,14 @@ python3 bfs_v3.py \
   --execute \
   --dest "/path/to/EECS 106B_meng/106B_reorganized_v3"
 
-Edits:
+Key behavior:
   - No MAX_ANCESTOR_DEPTH or truncation for concatenated descriptions
   - Study destination has NO "lecture/" injection:
       study/<top_folder>/<tail>
-  - Default model remains: gpt-5-mini-2025-08-07
   - File classification outputs are only: study/practice/support (handled in classify_v3.py).
+  - NEW: container folder collapsing for destination path:
+      assets/slides/x.pdf -> <cat>/slides/x.pdf  (drop "assets")
+      resources/slides/x.pdf -> <cat>/slides/x.pdf
 """
 
 import json
@@ -60,6 +62,14 @@ LLM_DEBUG_LOG_FILE = "bfs_v3_llm_debug.json"
 REPORT_MD_FILE = "bfs_v3_report.md"
 PLAN_JSON_FILE = "bfs_v3_plan.json"
 TREE_JSON_FILE = "bfs_v3_tree.json"
+
+# NEW: treat these as "container" top-level folders; we can drop them in dest layout
+CONTAINER_TOP_LEVELS: Set[str] = {
+    "assets", "asset",
+    "resources", "resource",
+    "materials", "material",
+    "static", "media", "files",
+}
 
 
 # ====================================================================
@@ -133,6 +143,7 @@ class CourseDB:
         self.conn: Optional[sqlite3.Connection] = None
 
     def connect(self) -> None:
+        """Connect to SQLite DB and validate expected table exists."""
         if not os.path.exists(self.db_path):
             raise FileNotFoundError(f"Database not found: {self.db_path}")
 
@@ -151,22 +162,29 @@ class CourseDB:
             )
 
     def close(self) -> None:
+        """Close DB connection."""
         if self.conn:
             self.conn.close()
             self.conn = None
 
     def _ensure_connected(self) -> sqlite3.Connection:
+        """Ensure DB is connected."""
         if self.conn is None:
             raise RuntimeError("Database not connected. Call db.connect() first.")
         return self.conn
 
     def load_file_index(self) -> Dict[str, FileIndexEntry]:
-        """Load all files from DB into an index keyed by file_name."""
+        """
+        Load all files from DB into an index keyed by file_name.
+        Note: if multiple rows share the same file_name, we keep the first.
+        """
         conn = self._ensure_connected()
         cur = conn.cursor()
+
+        # NOTE: fixed duplicated column in your original query.
         cur.execute(
             "SELECT uuid, file_name, description, original_path, "
-            "original_path, extra_info, file_hash FROM file"
+            "extra_info, file_hash FROM file"
         )
         rows = cur.fetchall()
 
@@ -194,6 +212,7 @@ class CourseDB:
         return index
 
     def get_uuids_for_files(self, file_names: List[str]) -> List[str]:
+        """Get UUID list for a list of file_names."""
         conn = self._ensure_connected()
         uuids: List[str] = []
         cur = conn.cursor()
@@ -374,10 +393,29 @@ def build_concat_desc(
     return "\n".join(parts)
 
 
-def top_level_folder(source_path: str) -> str:
-    """Extract top-level folder from a relative path."""
-    parts = source_path.replace("\\", "/").split("/")
-    return parts[0] if len(parts) > 1 else ""
+def split_top_and_tail_for_dest(source_rel: str) -> tuple[str, str]:
+    """
+    Split a relative path into (top_folder, tail_after_top) for destination layout.
+
+    Special rule:
+      If the first segment is a generic container (e.g., assets/resources/materials)
+      AND there is at least one nested folder, promote the second segment as top_folder.
+      Example:
+        assets/slides/lec3.pdf -> top=slides, tail=lec3.pdf
+        resources/handouts/disc01.pdf -> top=handouts, tail=disc01.pdf
+    """
+    parts = source_rel.replace("\\", "/").split("/")
+    if len(parts) <= 1:
+        return "", source_rel
+
+    if len(parts) >= 3 and parts[0] in CONTAINER_TOP_LEVELS:
+        top = parts[1]
+        tail = "/".join(parts[2:])
+        return top, tail
+
+    top = parts[0]
+    tail = "/".join(parts[1:])
+    return top, tail
 
 
 def build_dest_rel(category: str, top_folder: str, tail: str) -> str:
@@ -393,6 +431,7 @@ def build_dest_rel(category: str, top_folder: str, tail: str) -> str:
 
 
 def _join_rel(*parts: str) -> str:
+    """Join path parts using forward slashes."""
     clean = [p.strip().replace("\\", "/") for p in parts if p and p.strip()]
     return "/".join(clean)
 
@@ -431,11 +470,7 @@ def compute_sync_stats(
 class BFSTraverser:
     """Core BFS traversal engine."""
 
-    def __init__(
-        self,
-        db: CourseDB,
-        classifier: LLMClassifier,
-    ):
+    def __init__(self, db: CourseDB, classifier: LLMClassifier):
         self.db = db
         self.classifier = classifier
 
@@ -552,6 +587,7 @@ class BFSTraverser:
         skipped_folders: List[str],
         mappings: Dict[str, FileMapping],
     ) -> None:
+        """Classify a folder, then either descend or assign all files under it."""
         my_ancestors = ancestor_desc_map.get(item.path, [])
         my_task_name, my_seq_name = task_context_map.get(item.path, (None, None))
 
@@ -661,10 +697,8 @@ class BFSTraverser:
                 ancestor_descriptions=list(child_ancestors),
             )
 
-            top = top_level_folder(f.source_path)
-            tail = f.source_path
-            if top:
-                tail = f.source_path[len(top):].lstrip("/")
+            # NEW: container collapsing split
+            top, tail = split_top_and_tail_for_dest(f.source_path)
             dest_rel = build_dest_rel(result.category.value, top, tail)
 
             # Determine task/sequence for this file from the task_context_map
@@ -690,6 +724,7 @@ class BFSTraverser:
         classifications: Dict[str, Classification],
         mappings: Dict[str, FileMapping],
     ) -> None:
+        """Classify a single file (used when folder decision is SKIP/mixed or file lives at root)."""
         file_ancestors = ancestor_desc_map.get(item.folder_path, [])
 
         result = self.classifier.classify_file(
@@ -701,7 +736,6 @@ class BFSTraverser:
             f"[BFS] File '{item.source_path}': {result.category.value}"
         )
 
-        # classify_v3 guarantees file category is only study/practice/support
         classifications[item.source_path] = Classification(
             path=item.source_path,
             category=result.category,
@@ -710,10 +744,8 @@ class BFSTraverser:
             ancestor_descriptions=list(file_ancestors),
         )
 
-        top = top_level_folder(item.source_path)
-        tail = item.source_path
-        if top:
-            tail = item.source_path[len(top):].lstrip("/")
+        # NEW: container collapsing split
+        top, tail = split_top_and_tail_for_dest(item.source_path)
         dest_rel = build_dest_rel(result.category.value, top, tail)
 
         # Inherit task/sequence context from folder (or file-specific entry set during skip/mixed)
@@ -742,6 +774,7 @@ def _build_class_tree(
     classifications: Dict[str, Classification],
     folder_decisions: Dict[str, ClassificationResult],
 ) -> dict:
+    """Build a serializable tree for evaluation/debugging."""
     node_dict: dict = {
         "path": node.path,
         "name": node.name,
@@ -786,6 +819,7 @@ def export_tree_json(
     result: TraversalResult,
     out_path: str = TREE_JSON_FILE,
 ) -> None:
+    """Export classification results as a tree JSON."""
     if result.root_node is None:
         logger.warning("[TREE] root_node is None — skipping tree JSON export")
         return
@@ -1086,6 +1120,7 @@ def export_final_paths_json(
 # ====================================================================
 
 def _build_dest_tree(result: TraversalResult) -> dict:
+    """Build a nested dict representing destination folder structure."""
     tree: dict = {}
     for m in result.mappings.values():
         parts = m.dest_rel.split("/")
@@ -1097,6 +1132,7 @@ def _build_dest_tree(result: TraversalResult) -> dict:
 
 
 def _count_tree_files(node: dict) -> int:
+    """Count total files under a destination tree node."""
     count = len(node.get("__files__", []))
     for k, v in node.items():
         if k != "__files__":
@@ -1105,6 +1141,7 @@ def _count_tree_files(node: dict) -> int:
 
 
 def _render_dest_tree(node: dict, lines: List[str], indent: int, max_depth: int = 4) -> None:
+    """Render destination tree into markdown lines."""
     pad = "  " * indent
 
     for key in sorted(k for k in node if k != "__files__"):
@@ -1131,6 +1168,7 @@ def generate_report(
     classifier: LLMClassifier,
     out_path: str = REPORT_MD_FILE,
 ) -> None:
+    """Generate a markdown report summarizing the run."""
     lines: List[str] = []
 
     lines.append("# BFS v3 — Reorganization Report\n")
@@ -1214,6 +1252,7 @@ def generate_report(
 # ====================================================================
 
 def _tree_to_serializable(node: dict) -> dict:
+    """Convert destination tree dict into a JSON-friendly shape."""
     out: dict = {}
     files = node.get("__files__", [])
     if files:
@@ -1224,6 +1263,7 @@ def _tree_to_serializable(node: dict) -> dict:
 
 
 def export_mappings_json(result: TraversalResult, out_path: str = PLAN_JSON_FILE) -> None:
+    """Export plan JSON including decisions and destination tree."""
     dest_tree = _build_dest_tree(result)
 
     payload = {
@@ -1269,6 +1309,7 @@ def bfs_reorganize(
     final_paths_path: str = FINAL_PATHS_JSON_FILE,
     dest_dir: Optional[str] = None,
 ) -> TraversalResult:
+    """Convenience wrapper to run full pipeline."""
     db = CourseDB(db_path)
     db.connect()
 
@@ -1310,6 +1351,7 @@ def bfs_reorganize(
 
 
 def print_classification_summary(result: TraversalResult) -> None:
+    """Print a human-readable summary to stdout."""
     print("\n" + "=" * 70)
     print("BFS v3 — CLASSIFICATION SUMMARY")
     print("=" * 70)
@@ -1339,6 +1381,7 @@ def print_classification_summary(result: TraversalResult) -> None:
 # ====================================================================
 
 def main():
+    """CLI entry point."""
     import argparse
     import sys
 
