@@ -292,3 +292,101 @@ The rearrangement plan is a first-class artifact written to `outputs/<course>/re
 
 - `deep_reorg.py`, `dir_to_json.py`, `folder_to_Json.py` — sibling utilities that produce input trees. Not part of this pipeline; documented elsewhere.
 - `file_rearrang copy.py` — pre-refactor snapshot of the original 1894-line monolith. Safe to delete once you're confident in the new structure.
+
+---
+
+## Next Step: DB Mapping Orchestrator (`map_to_db_v2.py`)
+
+The sections above document the upstream course-folder rearrangement pipeline. `map_to_db_v2.py` is a separate downstream step: it writes reorganized course paths back into each course metadata SQLite database after the rearrangement plan and groundtruth folders exist.
+
+This script does not merge all course-specific matching rules into one generic implementation. Instead, it delegates to the per-course scripts:
+
+| Course | Delegated script | Metadata DB |
+|---|---|---|
+| CS61A | `61A/reorganization_v3.py` | `61A/metadata/CS 61A_metadata.db` |
+| EECS106B | `106B/reorganization.py` | `106B/metadata/EECS_106B_metadata.db` |
+
+This separation matters because CS61A and EECS106B intentionally differ in row-cardinality rules, UUID handling, fallback behavior, and duplicate path policy.
+
+### What it does
+
+- Loads the requested course implementation from this repository.
+- Overrides the delegated script's `NEW_TABLE` with `--output-table` (default: `file_new`).
+- Supports a dry run that builds mappings in memory and prints match statistics without writing to SQLite.
+- Creates a timestamped database backup before a real write.
+- Optionally drops nonessential tables after a successful write via `--cleanup`.
+- For CS61A only, can optionally materialize the physical/symlink logical output tree via `--create-logical-output`.
+
+### Basic usage
+
+Run commands from the repository root:
+
+```bash
+python map_to_db_v2.py --course cs61a --dry-run
+python map_to_db_v2.py --course eecs106b --dry-run
+```
+
+Write a new output table:
+
+```bash
+python map_to_db_v2.py --course cs61a --output-table file_new
+python map_to_db_v2.py --course eecs106b --output-table file_new
+```
+
+Write and then remove all tables except `file`, `problem`, `chunks`, and the output table:
+
+```bash
+python map_to_db_v2.py --course cs61a --output-table file_new --cleanup
+python map_to_db_v2.py --course eecs106b --output-table file_new --cleanup
+```
+
+For CS61A, also create the logical output tree:
+
+```bash
+python map_to_db_v2.py --course cs61a --output-table file_new --create-logical-output
+```
+
+### CLI reference
+
+| Flag | Required | Meaning |
+|---|---:|---|
+| `--course` | Yes | Course selector. Accepted values include `cs61a`, `61a`, `eecs106b`, and `106b`. |
+| `--output-table` | No | SQLite table to create. Defaults to `file_new`. |
+| `--dry-run` | No | Build mappings and print statistics without changing the DB. |
+| `--cleanup` | No | After a successful write, drop tables other than `file`, `problem`, `chunks`, and the output table. |
+| `--create-logical-output` | No | CS61A only. Also creates the delegated script's logical output tree. |
+
+### Dry-run output
+
+CS61A reports:
+
+- old row count from the original `file` table
+- matched source file count before and after duplicate logical-path resolution
+- expanded output row count
+- duplicate `logical_path` count after resolution
+- `original/...` fallback row count
+
+EECS106B reports:
+
+- old row count and output row count
+- source-type counts for `llm_json`, `practice_support_gt`, and fallback rows
+- top match reasons
+- duplicate `logical_path` summary
+- the projected path column name (`file_path` when the delegated script is in `DEVELOP_MODE = "down"`)
+
+### Safety notes
+
+- Dry runs are read-only and are the recommended first step before writing.
+- Real writes create a database backup named like `*.backup_before_<output_table>_<timestamp>.db`.
+- EECS106B's delegated script also creates its own backup during `main()`, so a full EECS106B write may produce two backup files.
+- `--cleanup` is destructive after the new table is created. Use it only when the extra tables are disposable.
+- EECS106B may report duplicate logical paths in dry-run output. That is tolerated by the delegated EECS106B writer because it preserves one output row per old DB row and does not create a unique path index.
+
+### Recent dry-run baseline
+
+From the current repository layout, the dry runs completed with these headline counts:
+
+| Course | Old rows | Output rows | Fallback rows | Duplicate logical paths |
+|---|---:|---:|---:|---:|
+| CS61A | 948 | 2000 | 153 | 0 |
+| EECS106B | 802 | 802 | 27 | 69 |
