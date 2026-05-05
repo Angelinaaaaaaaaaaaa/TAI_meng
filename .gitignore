@@ -1,9 +1,21 @@
-# Ignore course folder
+# Course folders
 61A/
 
-# Ignore Python cache
+# Python cache
 __pycache__/
+*.py[cod]
 
-/data
-/docs
-/.claude
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Project folders
+data/
+docs/
+
+# Local tool / editor folders
+.claude/
+
+# macOS
+.DS_Store
