@@ -167,13 +167,17 @@ def _derive_course_name(
 # LLM gateway
 # =============================================================================
 
+DEFAULT_LLM_MODEL = "gpt-5-mini"
+DEFAULT_LLM_SEED = 42
+
+
 def _llm_parse(
     client: OpenAI,
     model: str,
     system_prompt: str,
     user_payload: object,
     response_model,
-    seed: int = 42,
+    seed: int = DEFAULT_LLM_SEED,
 ):
     completion = client.beta.chat.completions.parse(
         model=model,
@@ -199,21 +203,21 @@ class LLMGateway:
 
     def parse_structured(
         self,
-        model: str,
-        system_prompt: str,
-        user_payload: object,
-        response_model,
-        seed: int = 42,
+        model: str = DEFAULT_LLM_MODEL,
+        system_prompt: str = "",
+        user_payload: object = None,
+        response_model=None,
+        seed: int = DEFAULT_LLM_SEED,
     ):
         return _llm_parse(
             self._client, model, system_prompt, user_payload, response_model, seed=seed
         )
 
     def refine_miscellaneous_groups(
-        self, misc_payload: List[Dict[str, str]], seed: int = 42
+        self, misc_payload: List[Dict[str, str]], seed: int = DEFAULT_LLM_SEED
     ) -> MiscRefinementResponse:
         completion = self._client.beta.chat.completions.parse(
-            model="gpt-5-mini",
+            model=DEFAULT_LLM_MODEL,
             messages=[
                 {
                     "role": "system",

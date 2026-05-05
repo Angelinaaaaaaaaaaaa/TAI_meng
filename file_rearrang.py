@@ -6,9 +6,7 @@ call sites can keep importing from ``file_rearrang`` until migrated.
 """
 
 from models import (  # noqa: F401
-    AggregationDecision,
     BackboneGroup,
-    BackboneGroupsResponse,
     BackboneResult,
     FileDescription,
     MiscGroupAssignment,
@@ -16,7 +14,6 @@ from models import (  # noqa: F401
     OrphanMatch,
     OrphanMatchResponse,
     PipelineContext,
-    RearrangedGroup,
 )
 from pipeline import (  # noqa: F401
     _build_context,
@@ -60,16 +57,19 @@ from steps import (  # noqa: F401
     _orphan_skip_backbone_subtree,
     aggregate_folder_descriptions,
     build_summary,
+    build_tree_from_final_paths,
     collect_orphan_items,
     enrich_structure_with_descriptions,
     extract_backbone_subtree,
     extract_file_descriptions,
     generate_rearrangement_plan,
-    get_folder_candidates,
-    merge_matches_into_groups,
+    merge_final_paths_into_tree,
+    reorganize_tree_by_final_paths,
     run_backbone_identification,
 )
 from utils import (  # noqa: F401
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_SEED,
     LLMGateway,
     _chunked,
     _console_safe,

@@ -19,8 +19,10 @@ Layout per run:
 import argparse
 import json
 import sqlite3
+import sys
+import traceback
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
 
@@ -34,10 +36,14 @@ from steps import (
     collect_orphan_items,
     enrich_structure_with_descriptions,
     extract_backbone_subtree,
+    build_tree_from_final_paths,
     generate_rearrangement_plan,
+    reorganize_tree_by_final_paths,
     run_backbone_identification,
 )
 from utils import (
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_SEED,
     LLMGateway,
     _chunked,
     _derive_course_name,
@@ -128,14 +134,28 @@ def _write_json(path: Path, data, *, indent: int = 4) -> None:
 
 def run_enrichment(
     base_dir: PathLike,
-    input_filename: str,
+    input_filename: Optional[str],
     db_filename: Optional[str] = None,
     course_name: Optional[str] = None,
     multi_match: bool = False,
+    final_paths_filename: Optional[str] = None,
 ) -> str:
-    """Preprocessing: parse input tree JSON + SQLite DB → enriched JSON."""
+    """Preprocessing: parse input tree JSON + SQLite DB → enriched JSON.
+
+    Three ways to source the input tree:
+      • ``input_filename`` + ``final_paths_filename``  → reorganize the first-pass
+        tree using team 1's second-pass routing. Preserves first-pass file
+        metadata (e.g. ``file_hash``) when the source is in both files.
+        Recommended whenever both files are available.
+      • ``final_paths_filename`` only  → build a fresh tree from team 1's
+        second-pass doc. No first-pass metadata available.
+      • ``input_filename`` only  → load the first-pass tree as-is (legacy mode).
+
+    When ``final_paths_filename`` is supplied, the constructed/reorganized tree
+    is also persisted to ``outputs/<course>/v4_tree_reorganized.json`` for
+    inspection.
+    """
     base = Path(base_dir)
-    input_file = _resolve_input_path(base, input_filename)
 
     if db_filename:
         db_file = _resolve_input_path(base, db_filename)
@@ -153,11 +173,106 @@ def run_enrichment(
     print(f"Preprocessing: Enriching structure for course '{course_name}'")
     print("=" * 60)
     print(f"Database path: {db_file}")
-    print(f"Input file path: {input_file}")
+
+    pre_built: Optional[Dict] = None
+    input_file_for_log: Optional[Path] = None
+
+    if final_paths_filename:
+        final_paths_file = _resolve_input_path(base, final_paths_filename)
+        if not final_paths_file.exists():
+            raise FileNotFoundError(
+                f"--final-paths file not found: {final_paths_file}"
+            )
+        final_paths_doc = load_json_file(final_paths_file)
+
+        if input_filename:
+            # Both files provided: reorganize the first-pass tree using the
+            # second-pass routing. Preserves first-pass file metadata
+            # (real file_hash, etc.) when the source is in both files.
+            tree_file = _resolve_input_path(base, input_filename)
+            if not tree_file.exists():
+                raise FileNotFoundError(f"--input file not found: {tree_file}")
+            print(f"Input tree:      {tree_file}")
+            print(f"Final-paths doc: {final_paths_file}")
+            raw_tree = load_json_file(tree_file)
+            pre_built = reorganize_tree_by_final_paths(raw_tree, final_paths_doc)
+            input_file_for_log = tree_file
+        else:
+            # Only final-paths: build from scratch (no first-pass tree available).
+            print(f"Final-paths doc: {final_paths_file}")
+            pre_built = build_tree_from_final_paths(final_paths_doc)
+            input_file_for_log = final_paths_file
+
+        out = output_dir / "v4_tree_reorganized.json"
+        _write_json(out, pre_built, indent=2)
+        print(f"Reorganized tree saved to: {out}")
+    else:
+        if not input_filename:
+            raise ValueError(
+                "Either --input or --final-paths must be provided for the 'enrich' step."
+            )
+        input_file_for_log = _resolve_input_path(base, input_filename)
+        print(f"Input file path: {input_file_for_log}")
 
     return enrich_structure_with_descriptions(
-        str(input_file), str(db_file), str(enriched_output), multi_match=multi_match
+        str(input_file_for_log) if input_file_for_log else "",
+        str(db_file),
+        str(enriched_output),
+        multi_match=multi_match,
+        input_data=pre_built,
     )
+
+
+def _raw_tree_folder_to_structure_node(
+    raw_folder: Dict[str, Any], hash_map: Dict[str, str]
+) -> Dict[str, Any]:
+    """Convert the v4 reorganized tree shape (children/files dicts) into the
+    structure-tree node shape (children list).
+
+    This is intentionally minimal: it preserves hierarchy and populates
+    file hashes when possible.
+    """
+
+    relative_path = raw_folder.get("relative_path") or raw_folder.get("path") or ""
+    node: Dict[str, Any] = {
+        "type": "folder",
+        "name": raw_folder.get("name") or "",
+        "relative_path": relative_path,
+        "description": raw_folder.get("folder_description") or "",
+        "children": [],
+    }
+
+    raw_children = raw_folder.get("children") or {}
+    for child_name in sorted(raw_children.keys()):
+        child = raw_children[child_name]
+        if isinstance(child, dict) and child.get("type") == "folder":
+            node["children"].append(_raw_tree_folder_to_structure_node(child, hash_map))
+
+    raw_files = raw_folder.get("files") or {}
+    # raw_files is keyed by file_hash in many inputs, but can vary.
+    file_nodes: List[Dict[str, Any]] = []
+    for file_obj in raw_files.values():
+        if not isinstance(file_obj, dict) or file_obj.get("type") != "file":
+            continue
+        file_rel = file_obj.get("final_path") or file_obj.get("path") or ""
+        file_name = file_obj.get("name") or ""
+        file_hash = (
+            hash_map.get(file_rel)
+            or file_obj.get("file_hash")
+            or hash_map.get(f"__NAME__{file_name}")
+            or ""
+        )
+        file_node: Dict[str, Any] = {
+            "type": "file",
+            "name": file_name,
+            "relative_path": file_rel,
+            "file_hash": file_hash,
+        }
+        file_nodes.append(file_node)
+
+    file_nodes.sort(key=lambda d: (d.get("name") or "", d.get("relative_path") or ""))
+    node["children"].extend(file_nodes)
+    return node
 
 
 def run_plan_matching(
@@ -200,19 +315,18 @@ def run_plan_matching(
     all_matches = []
     chunk_size = 50
     total_orphans = len(orphans)
-    print(f"Processing {total_orphans} orphans in batches of {chunk_size}...")
+    total_batches = (total_orphans + chunk_size - 1) // chunk_size
+    print(f"Processing {total_orphans} orphans in {total_batches} batches of {chunk_size}...")
 
     system_prompt = _build_matching_system_prompt(backbone_path, multi_match)
+    batch_failures = 0
 
     for batch_index, batch_orphans in enumerate(_chunked(orphans, chunk_size), start=1):
-        print(
-            f"Processing batch {batch_index} / "
-            f"{(total_orphans + chunk_size - 1) // chunk_size}..."
-        )
+        print(f"Processing batch {batch_index} / {total_batches}...")
 
         try:
             batch_result = gateway.parse_structured(
-                model="gpt-5-mini",
+                model=DEFAULT_LLM_MODEL,
                 system_prompt=system_prompt,
                 user_payload={
                     "backbone_folder": backbone_path,
@@ -220,7 +334,7 @@ def run_plan_matching(
                     "orphans": batch_orphans,
                 },
                 response_model=OrphanMatchResponse,
-                seed=42,
+                seed=DEFAULT_LLM_SEED,
             )
 
             filtered_matches = _filter_matches(batch_result, batch_orphans)
@@ -231,7 +345,18 @@ def run_plan_matching(
                 print("  - Warning: No matches returned for this batch.")
 
         except Exception as e:
-            _safe_print(f"  - Error processing batch: {e}")
+            batch_failures += 1
+            _safe_print(f"  - Error processing batch {batch_index}: {e}")
+
+    if batch_failures:
+        _safe_print(
+            f"WARNING: {batch_failures}/{total_batches} batches failed; "
+            f"matched {len(all_matches)}/{total_orphans} orphans before fallback."
+        )
+        if batch_failures == total_batches:
+            raise RuntimeError(
+                "All matching batches failed — check OpenAI key, quota, or network."
+            )
 
     matches = OrphanMatchResponse(matches=all_matches)
     unmatched_added = _append_unmatched_orphans_to_misc(orphans, matches.matches)
@@ -289,11 +414,14 @@ def load_file_hashes(db_path: PathLike) -> Dict[str, str]:
 
 
 def index_enriched_data(enriched_data: Dict) -> Dict[str, Dict]:
-    """Index the enriched data tree by relative_path AND name for fast lookups."""
+    """Index the enriched tree by path (folder ``relative_path``, file ``source``) and name."""
     index: Dict[str, Dict] = {}
 
     def traverse(node):
-        path = node.get("relative_path")
+        if node.get("type") == "file":
+            path = node.get("source") or node.get("relative_path")
+        else:
+            path = node.get("relative_path")
         name = node.get("name")
         if path:
             index[path] = node
@@ -310,22 +438,30 @@ def index_enriched_data(enriched_data: Dict) -> Dict[str, Dict]:
 
 def build_node_recursive(original_node: Dict, hash_map: Dict[str, str]) -> Dict:
     """Recursively build a node for the new tree, populating hashes for files."""
-    new_node = {
-        "type": original_node.get("type", "folder"),
+    ntype = original_node.get("type", "folder")
+    new_node: Dict[str, Any] = {
+        "type": ntype,
         "name": original_node.get("name"),
-        "relative_path": original_node.get("relative_path"),
         "description": original_node.get("description", ""),
     }
+    # Carry team-1 routing fields through to the final artifact when present.
+    for passthrough in ("final_path", "task_name", "sequence_name"):
+        if original_node.get(passthrough) is not None:
+            new_node[passthrough] = original_node[passthrough]
 
-    if new_node["type"] == "file":
-        rel_path = new_node.get("relative_path", "")
-        file_hash = hash_map.get(rel_path)
-        if not file_hash:
-            fname = new_node.get("name")
-            if fname:
-                file_hash = hash_map.get(f"__NAME__{fname}")
+    if ntype == "file":
+        disk = original_node.get("source") or original_node.get("relative_path") or ""
+        if disk:
+            new_node["source"] = disk
+        fname = new_node.get("name")
+        file_hash = hash_map.get(disk)
+        if not file_hash and fname:
+            file_hash = hash_map.get(f"__NAME__{fname}")
         new_node["file_hash"] = file_hash or ""
-    elif new_node["type"] == "folder":
+    else:
+        rp = original_node.get("relative_path")
+        if rp:
+            new_node["relative_path"] = rp
         new_node["children"] = [
             build_node_recursive(c, hash_map) for c in (original_node.get("children") or [])
         ]
@@ -403,27 +539,65 @@ def _build_group_node(
 
 
 def build_rearranged_structure_tree(
-    plan_path: PathLike, enriched_data_path: PathLike, db_path: PathLike, output_path: PathLike
+    plan_path: PathLike,
+    enriched_data_path: PathLike,
+    db_path: PathLike,
+    output_path: PathLike,
+    reorganized_tree: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Build a full hierarchical tree based on the rearrangement plan."""
+    """Build a full hierarchical tree based on the rearrangement plan.
+
+    Raises FileNotFoundError / ValueError on missing or malformed inputs;
+    the orchestrator is responsible for surfacing the failure to the user.
+    """
     print("Building rearranged structure tree...")
 
-    try:
-        plan_data = load_json_file(str(plan_path))
-        enriched_data = load_json_file(str(enriched_data_path))
-        hash_map = load_file_hashes(db_path)
-    except Exception as e:
-        print(f"Error loading inputs: {e}")
-        return
+    plan_data = load_json_file(str(plan_path))
+    enriched_data = load_json_file(str(enriched_data_path))
+    hash_map = load_file_hashes(db_path)
 
     enriched_index = index_enriched_data(enriched_data)
 
     plan_groups = _load_plan_groups(plan_data)
     if not plan_groups:
-        print("Error: Invalid plan format")
-        return
+        raise ValueError(
+            f"Invalid plan format at {plan_path}: expected a list or {{'groups': [...]}}."
+        )
 
-    result_tree = [_build_group_node(g, enriched_index, hash_map) for g in plan_groups]
+    study_children = [_build_group_node(g, enriched_index, hash_map) for g in plan_groups]
+
+    # Keep the artifact as a list of group nodes, but ensure all rearranged
+    # study content is under one top-level group.
+    result_tree = [
+        {
+            "type": "group",
+            "name": "Study",
+            "children": study_children,
+        }
+    ]
+
+    # Append non-study sections (practice/, support/) from the reorganized tree
+    # when available. IMPORTANT: we do not implicitly read intermediate outputs
+    # as inputs. Callers should pass the reorganized tree (preferred), or an
+    # explicit path if needed.
+    try:
+        if isinstance(reorganized_tree, dict):
+            raw_children = reorganized_tree.get("children") or {}
+
+            for section_key in ("practice", "support"):
+                raw_section = raw_children.get(section_key)
+                if isinstance(raw_section, dict) and raw_section.get("type") == "folder":
+                    section_node = _raw_tree_folder_to_structure_node(raw_section, hash_map)
+                    result_tree.append(
+                        {
+                            "type": "group",
+                            "name": section_key.capitalize(),
+                            "children": [section_node],
+                        }
+                    )
+    except Exception as e:
+        print(f"Warning: failed to append practice/support sections: {e}")
+
     _write_json(Path(output_path), result_tree, indent=2)
     print(f"Rearranged structure tree saved to: {output_path}")
 
@@ -461,8 +635,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=False,
         default=None,
         help=(
-            "Tree JSON filename inside 'input/' (or absolute path). "
-            "Required for the 'enrich' and 'all' steps; ignored otherwise."
+            "First-pass tree JSON filename inside 'input/' (or absolute path). "
+            "Optional when --final-paths is supplied: passing both reorganizes "
+            "the first-pass tree to match team 1's second-pass routing while "
+            "preserving any first-pass file metadata (e.g. file_hash). "
+            "Required for 'enrich' / 'all' when --final-paths is NOT supplied."
         ),
     )
     parser.add_argument(
@@ -493,6 +670,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Pass 'true' (default) for multi-match; 'false' for single-best-group."
         ),
     )
+    parser.add_argument(
+        "--final-paths",
+        required=False,
+        default=None,
+        help=(
+            "Team-1 second-pass classification JSON (filename inside 'input/' or absolute path). "
+            "Used together with --input to reorganize the first-pass tree, "
+            "or alone to build the tree from scratch. Either way the result is "
+            "written to outputs/<course>/v4_tree_reorganized.json for inspection."
+        ),
+    )
     return parser
 
 
@@ -501,10 +689,11 @@ def parse_cli_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def _step_enrich(context: PipelineContext, base_dir: Path, args: argparse.Namespace) -> None:
-    if not args.input:
+    final_paths = getattr(args, "final_paths", None)
+    if not args.input and not final_paths:
         raise ValueError(
-            "--input is required for the 'enrich' / 'all' steps. "
-            "Pass the tree JSON filename (relative to input/) or an absolute path."
+            "Provide either --input (first-pass tree) or --final-paths "
+            "(team-1 second-pass doc) for the 'enrich' / 'all' steps."
         )
     run_enrichment(
         base_dir,
@@ -512,6 +701,7 @@ def _step_enrich(context: PipelineContext, base_dir: Path, args: argparse.Namesp
         args.db,
         context.course_name,
         multi_match=context.multi_match,
+        final_paths_filename=final_paths,
     )
 
 
@@ -539,6 +729,9 @@ def _step_match(context: PipelineContext, base_dir: Path, args: argparse.Namespa
     else:
         print("No backbone result found, running backbone identification first...")
         backbone_path = run_backbone_identification(enriched_data)
+        # Persist so re-runs of `match` don't re-pay the LLM call.
+        _write_json(backbone_file, {"backbone_path": backbone_path})
+        print(f"Backbone result saved to: {backbone_file}")
 
     matches, plan = run_plan_matching(
         enriched_data,
@@ -575,7 +768,41 @@ def _step_tree(context: PipelineContext, base_dir: Path, args: argparse.Namespac
 
     db_path = _resolve_db_path(base_dir, args.db)
     output_tree_path = output_dir / "rearrangement_structure_tree.json"
-    build_rearranged_structure_tree(plan_path, enriched_path, db_path, output_tree_path)
+
+    # Source the reorganized full-course tree (used to append practice/support
+    # top-level groups). Resolution order:
+    #   1. Re-build from original inputs when --final-paths is supplied (and
+    #      --input, for the reorganize path that preserves first-pass metadata).
+    #   2. Fall back to the persisted v4_tree_reorganized.json artifact written
+    #      by `enrich`. This is the *only* downstream step that reads back from
+    #      outputs/, and it does so as a cache — never as a pipeline input.
+    reorganized_tree: Optional[Dict[str, Any]] = None
+    try:
+        final_paths = getattr(args, "final_paths", None)
+        if final_paths:
+            final_paths_file = _resolve_input_path(base_dir, final_paths)
+            final_paths_doc = load_json_file(final_paths_file)
+            if args.input:
+                tree_file = _resolve_input_path(base_dir, args.input)
+                raw_tree = load_json_file(tree_file)
+                reorganized_tree = reorganize_tree_by_final_paths(raw_tree, final_paths_doc)
+            else:
+                reorganized_tree = build_tree_from_final_paths(final_paths_doc)
+        else:
+            cached = output_dir / "v4_tree_reorganized.json"
+            if cached.exists():
+                print(f"Loading cached reorganized tree from: {cached}")
+                reorganized_tree = load_json_file(str(cached))
+    except Exception as e:
+        print(f"Warning: failed to obtain reorganized tree for practice/support append: {e}")
+
+    build_rearranged_structure_tree(
+        plan_path,
+        enriched_path,
+        db_path,
+        output_tree_path,
+        reorganized_tree=reorganized_tree,
+    )
 
 
 _STEP_DISPATCH = {
@@ -590,16 +817,19 @@ _STEP_DISPATCH = {
 def execute_pipeline_steps(
     context: PipelineContext, base_dir: PathLike, args: argparse.Namespace
 ) -> None:
-    """Run the requested step(s) according to ``args.step``."""
-    base = Path(base_dir)
-    try:
-        for step_fn in _STEP_DISPATCH[args.step]:
-            step_fn(context, base, args)
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
+    """Run the requested step(s) according to ``args.step``.
 
-        traceback.print_exc()
+    Any step exception is logged and re-raised so the caller can fail fast
+    (and so ``--step all`` doesn't silently continue against stale artifacts).
+    """
+    base = Path(base_dir)
+    for step_fn in _STEP_DISPATCH[args.step]:
+        try:
+            step_fn(context, base, args)
+        except Exception as e:
+            print(f"Error in step '{args.step}': {e}")
+            traceback.print_exc()
+            raise
 
 
 def run_pipeline_cli(
@@ -627,9 +857,14 @@ def run_pipeline_cli(
 def run_tree_step(
     context: PipelineContext, base_dir: PathLike, args: argparse.Namespace
 ) -> None:
-    """Back-compat shim: previously a separate CLI entry; now just dispatches step=tree."""
-    args.step = "tree"
-    run_pipeline_cli(args, base_dir=base_dir, context=context)
+    """Back-compat shim for callers that used the standalone tree entry.
+
+    Calls the tree step directly without mutating ``args`` or re-binding the
+    log ContextVar / re-printing the header (which ``run_pipeline_cli`` does).
+    Assumes the caller has already entered an enclosing ``run_pipeline_cli`` /
+    ``set_pipeline_log_dir`` context.
+    """
+    _step_tree(context, Path(base_dir), args)
 
 
 def _run_pipeline(args: argparse.Namespace) -> None:
@@ -641,7 +876,10 @@ def main() -> None:
     args = parse_cli_args()
     base_dir = Path(__file__).resolve().parent
     context = _build_context(args, base_dir)
-    run_pipeline_cli(args, base_dir=base_dir, context=context)
+    try:
+        run_pipeline_cli(args, base_dir=base_dir, context=context)
+    except Exception:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
