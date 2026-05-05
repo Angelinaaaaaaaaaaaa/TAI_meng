@@ -3,3 +3,6 @@
 
 # Ignore Python cache
 __pycache__/
+
+/data
+/.claude
