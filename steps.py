@@ -22,15 +22,318 @@ from models import (
     FileDescription,
     OrphanMatch,
     OrphanMatchResponse,
-    RearrangedGroup,
 )
 from utils import (
+    DEFAULT_LLM_MODEL,
+    DEFAULT_LLM_SEED,
     LLMGateway,
     _is_under_path,
     _normalize_path,
     _safe_print,
     save_debug_log,
 )
+
+
+# =============================================================================
+# 0. Pre-enrichment: build/reorganize the input tree from team-1's handoff
+# =============================================================================
+#
+# Team 1 hands us two artifacts: a first-pass tree (`bfs_v4_tree.json`) and a
+# second-pass classification doc (`bfs_v4_final_paths.json`). Empirically the
+# two don't agree — the second pass classifies more files than the first-pass
+# tree contains — so the second pass is treated as the source of truth.
+#
+# Two helpers below:
+#   • build_tree_from_final_paths(doc)             — recommended; ignores tree.
+#   • reorganize_tree_by_final_paths(tree, doc)    — kept for hybrid runs that
+#                                                     want to preserve any
+#                                                     first-pass metadata that
+#                                                     happens to match.
+
+def build_tree_from_final_paths(final_paths_doc: Dict) -> Dict:
+    """Build a fresh input tree from team 1's second-pass classification doc.
+
+    Each entry in ``all_final_paths`` becomes a file node placed at its
+    ``final_path`` location. Folders are created on-demand. ``file_hash`` is
+    left empty here and is resolved later by name-based lookup in the metadata
+    DB (see :func:`pipeline.load_file_hashes`).
+
+    Output mirrors the shape of the original first-pass tree (root with
+    ``children`` and ``files`` dicts), so existing enrichment / orphan-collection
+    code consumes it unchanged.
+    """
+    entries = final_paths_doc.get("all_final_paths", []) if isinstance(final_paths_doc, dict) else []
+
+    new_root: Dict = {
+        "name": "root",
+        "type": "folder",
+        "path": "",
+        "relative_path": None,
+        "category": None,
+        "children": {},
+        "files": {},
+    }
+
+    placed = 0
+    duplicate_targets = 0
+    seen_keys: set = set()
+    seen_targets: set = set()
+
+    for entry in entries:
+        final_path = entry.get("final_path")
+        src = entry.get("source")
+        if not final_path:
+            continue
+
+        # Dedupe in case the doc lists the same source/final_path twice.
+        key = (src, final_path)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        if final_path in seen_targets:
+            duplicate_targets += 1
+            continue
+        seen_targets.add(final_path)
+
+        new_fd = {
+            "type": "file",
+            "name": Path(final_path).name,
+            "path": final_path,
+            "file_hash": "",
+            "category": entry.get("category"),
+            "final_path": final_path,
+        }
+        if src:
+            new_fd["source"] = src
+        if entry.get("task_name") is not None:
+            new_fd["task_name"] = entry["task_name"]
+        if entry.get("sequence_name") is not None:
+            new_fd["sequence_name"] = entry["sequence_name"]
+        if entry.get("category_depth") is not None:
+            new_fd["category_depth"] = entry["category_depth"]
+
+        _place_file_at(new_root, final_path, new_fd, category_root=entry.get("category"))
+        placed += 1
+
+    _annotate_folder_sequences(new_root)
+    msg = f"[build] Built tree with {placed} files from {len(entries)} team-1 entries"
+    if duplicate_targets:
+        msg += f" ({duplicate_targets} dropped as duplicate targets)"
+    print(msg + ".")
+    return new_root
+
+
+def _collect_tree_files(tree: Dict) -> Dict[str, Dict]:
+    """Index every file node in the source tree by its `path` field."""
+    by_path: Dict[str, Dict] = {}
+
+    def walk(node: Dict) -> None:
+        files = node.get("files") or {}
+        if isinstance(files, dict):
+            for fd in files.values():
+                p = fd.get("path")
+                if p:
+                    by_path[p] = fd
+        children = node.get("children")
+        if isinstance(children, dict):
+            for c in children.values():
+                walk(c)
+        elif isinstance(children, list):
+            for c in children:
+                walk(c)
+
+    walk(tree)
+    return by_path
+
+
+def reorganize_tree_by_final_paths(tree: Dict, final_paths_doc: Dict) -> Dict:
+    """Rebuild the source tree so each file sits at its team-1 ``final_path`` location.
+
+    The first pass (``tree``) gives raw structure + per-file metadata (file_hash,
+    name, etc.). The second pass (``final_paths_doc``) gives the corrected target
+    placement. Output mirrors the input shape (root with ``children`` dict and
+    ``files`` dict), so existing enrichment / orphan-collection code consumes it
+    unchanged.
+
+    Each file in the rebuilt tree carries its original ``file_hash`` plus team-1
+    fields ``final_path``, ``task_name``, ``sequence_name``. Folders along the
+    final-path hierarchy are created with ``category`` set from the first
+    segment (``study`` / ``practice`` / ``support``); ``by_sequence`` is set
+    True when all immediate file children share the same ``sequence_name``.
+    """
+    entries = final_paths_doc.get("all_final_paths", []) if isinstance(final_paths_doc, dict) else []
+    files_by_path = _collect_tree_files(tree)
+
+    new_root: Dict = {
+        "name": "root",
+        "type": "folder",
+        "path": "",
+        "relative_path": None,
+        "category": None,
+        "children": {},
+        "files": {},
+    }
+
+    placed_with_tree = 0
+    placed_as_placeholder = 0
+    duplicate_targets = 0
+    seen_keys: set = set()
+    seen_targets: set = set()
+
+    for entry in entries:
+        src = entry.get("source")
+        final_path = entry.get("final_path")
+        if not src or not final_path:
+            continue
+
+        # Dedupe consistently with build_tree_from_final_paths: one entry per
+        # unique (source, final_path) pair.
+        key = (src, final_path)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        if final_path in seen_targets:
+            duplicate_targets += 1
+            continue
+        seen_targets.add(final_path)
+
+        source_fd = files_by_path.get(src)
+
+        if source_fd is not None:
+            # Real tree entry: carry file_hash + any tree-side metadata through.
+            new_fd = dict(source_fd)
+            placed_with_tree += 1
+        else:
+            # Team 1 classified this file but it wasn't in the first-pass tree.
+            # Create a placeholder so the reorganized tree mirrors team 1's full
+            # second-pass result. Hash will be filled in later by load_file_hashes
+            # (which can resolve by file_name from the metadata DB).
+            new_fd = {
+                "type": "file",
+                "name": Path(src).name,
+                "path": src,
+                "file_hash": "",
+                "missing_from_first_pass": True,
+            }
+            placed_as_placeholder += 1
+
+        # Apply team-1 fields (these always win — second pass is authoritative).
+        new_fd["final_path"] = final_path
+        new_fd["category"] = entry.get("category", new_fd.get("category"))
+        if entry.get("task_name") is not None:
+            new_fd["task_name"] = entry["task_name"]
+        if entry.get("sequence_name") is not None:
+            new_fd["sequence_name"] = entry["sequence_name"]
+        if entry.get("category_depth") is not None:
+            new_fd["category_depth"] = entry["category_depth"]
+        # Original on-disk path from team 1 (carried as enriched file ``source``).
+        new_fd["source"] = src
+        # Make `.path` reflect the new location so downstream path-based code agrees.
+        new_fd["path"] = final_path
+
+        _place_file_at(new_root, final_path, new_fd, category_root=entry.get("category"))
+
+    _annotate_folder_sequences(new_root)
+
+    total_placed = placed_with_tree + placed_as_placeholder
+    msg = (
+        f"[reorg] Placed {total_placed} files at their final_path "
+        f"({placed_with_tree} backed by tree, {placed_as_placeholder} placeholders)"
+    )
+    if duplicate_targets:
+        msg += f"; {duplicate_targets} dropped as duplicate targets"
+    print(msg + ".")
+    return new_root
+
+
+def _place_file_at(
+    root: Dict, final_path: str, file_node: Dict, *, category_root: Optional[str]
+) -> None:
+    parts = final_path.split("/")
+    if not parts:
+        return
+
+    cur = root
+    running: List[str] = []
+    for folder_name in parts[:-1]:
+        running.append(folder_name)
+        children = cur.setdefault("children", {})
+        if folder_name not in children:
+            children[folder_name] = {
+                "name": folder_name,
+                "type": "folder",
+                "path": "/".join(running),
+                "relative_path": "/".join(running),
+                # Top-level folder takes its category from team 1; deeper folders inherit.
+                "category": category_root if len(running) == 1 else cur.get("category"),
+                "children": {},
+                "files": {},
+            }
+        cur = children[folder_name]
+
+    files = cur.setdefault("files", {})
+    key = file_node.get("file_hash") or final_path
+    files[key] = file_node
+
+
+def _uniform_sequence_in_subtree(node: Dict) -> Optional[str]:
+    """If every file descendant of ``node`` shares a single ``sequence_name``,
+    return it; otherwise return None. A node with no sequenced descendants
+    also returns None."""
+    seen: set = set()
+
+    def walk(n: Dict) -> bool:
+        for fd in (n.get("files") or {}).values():
+            seq = fd.get("sequence_name")
+            if seq:
+                seen.add(seq)
+                if len(seen) > 1:
+                    return False
+        for c in (n.get("children") or {}).values():
+            if not walk(c):
+                return False
+        return True
+
+    walk(node)
+    return next(iter(seen)) if len(seen) == 1 else None
+
+
+def _annotate_folder_sequences(node: Dict) -> None:
+    """Set ``by_sequence=True`` on folders that act as a *sequence container*:
+    at least two of their direct child folders each represent a single,
+    distinct sequence step (uniform ``sequence_name`` across descendants).
+
+    Examples:
+      • ``study/slides/`` whose children 01..21 each carry a unique seq → True.
+      • ``study/slides/01/`` (files of one step, no child folders) → False.
+      • ``study/`` whose children are topic folders spanning many seqs → False.
+    """
+    children = node.get("children") or {}
+    if isinstance(children, dict):
+        child_step_seqs: set = set()
+        for c in children.values():
+            if c.get("type") != "folder":
+                continue
+            seq = _uniform_sequence_in_subtree(c)
+            if seq is not None:
+                child_step_seqs.add(seq)
+        if len(child_step_seqs) >= 2:
+            node["by_sequence"] = True
+
+        for c in children.values():
+            _annotate_folder_sequences(c)
+
+
+# Back-compat: previous name annotated metadata in place. New behavior reorganizes.
+def merge_final_paths_into_tree(tree: Dict, final_paths_doc: Dict) -> Dict:
+    """Deprecated alias — now delegates to :func:`reorganize_tree_by_final_paths`.
+
+    Retained so existing imports keep working. The rebuilt tree is returned;
+    the input ``tree`` argument is no longer mutated.
+    """
+    return reorganize_tree_by_final_paths(tree, final_paths_doc)
 
 
 # =============================================================================
@@ -44,11 +347,13 @@ class _EnrichmentStats:
 
 
 def _enrich_should_keep_branch(
-    category: str, node_name: str, parent_force_keep: bool, multi_match: bool
+    category, node_name, parent_force_keep: bool, multi_match: bool
 ) -> bool:
     """Whether this node's subtree is eligible for study/practice retention."""
-    is_study = category == "study"
-    if multi_match and (category.lower() == "practice" or node_name.lower() == "practice"):
+    cat = (category or "").lower()
+    name = (node_name or "").lower()
+    is_study = cat == "study"
+    if multi_match and (cat == "practice" or name == "practice"):
         is_study = True
     return is_study or parent_force_keep
 
@@ -73,10 +378,16 @@ def _enrich_resolve_relative_path(
     return rel_path
 
 
+def _enriched_file_disk_path(node: Dict) -> str:
+    """On-disk path for a file in the enriched tree (``source``, else legacy ``relative_path``)."""
+    return str(node.get("source") or node.get("relative_path") or "").replace("\\", "/")
+
+
 def _enrich_rebase_paths_under_prefix(node: Dict, old_prefix: str, new_prefix: str) -> None:
-    path = node.get("relative_path")
-    if path and path.startswith(old_prefix):
-        node["relative_path"] = new_prefix + path[len(old_prefix):]
+    for key in ("relative_path", "source"):
+        path = node.get(key)
+        if path and str(path).startswith(old_prefix):
+            node[key] = new_prefix + str(path)[len(old_prefix) :]
     for child in node.get("children", []) or []:
         _enrich_rebase_paths_under_prefix(child, old_prefix, new_prefix)
 
@@ -140,18 +451,32 @@ def _enrich_process_children(
 
 
 def enrich_structure_with_descriptions(
-    input_json_path: str, db_path: str, output_path: str, multi_match: bool = False
+    input_json_path: str,
+    db_path: str,
+    output_path: str,
+    multi_match: bool = False,
+    *,
+    input_data: Optional[Dict] = None,
 ) -> str:
     """Parse the input tree JSON, filter for 'study' category, fetch descriptions
-    from database, and generate a standardized list-based JSON tree."""
-    print(f"Reading input structure from: {input_json_path}")
+    from database, and generate a standardized list-based JSON tree.
 
-    input_path = Path(input_json_path)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+    Folder nodes use ``relative_path`` in the enriched tree layout. File nodes
+    store the on-disk path as ``source`` (from team 1, e.g. ``bfs_v4_final_paths``
+    ``source`` field); ``final_path`` remains the classified tree location.
 
-    with input_path.open("r", encoding="utf-8") as f:
-        input_data = json.load(f)
+    Pass ``input_data`` to skip reading from disk (e.g. when a pre-merged tree is
+    already in memory).
+    """
+    if input_data is None:
+        print(f"Reading input structure from: {input_json_path}")
+        input_path = Path(input_json_path)
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+        with input_path.open("r", encoding="utf-8") as f:
+            input_data = json.load(f)
+    else:
+        print(f"Using pre-loaded input tree (origin: {input_json_path})")
 
     db = Path(db_path)
     if not db.exists():
@@ -188,17 +513,27 @@ def enrich_structure_with_descriptions(
         should_keep_this = _enrich_should_keep_branch(
             category, node_name, parent_force_keep, multi_match
         )
-        rel_path = _enrich_resolve_relative_path(node_data, node_name, current_path)
 
         if node_type == "file":
             filename = node_data.get("name", node_name)
             if _enrich_should_skip_file(filename):
                 return None
+            src = node_data.get("source")
+            if src:
+                rel_path = str(src).replace("\\", "/")
+            else:
+                rel_path = _enrich_resolve_relative_path(
+                    node_data, node_name, current_path
+                )
             new_node: Dict = {
                 "type": "file",
                 "name": filename,
-                "relative_path": rel_path,
+                "source": rel_path,
             }
+            # Carry team-1 routing fields through, when present.
+            for passthrough in ("final_path", "task_name", "sequence_name"):
+                if node_data.get(passthrough) is not None:
+                    new_node[passthrough] = node_data[passthrough]
             desc = get_file_description(filename)
             if desc:
                 new_node["description"] = desc
@@ -206,6 +541,7 @@ def enrich_structure_with_descriptions(
             stats.processed += 1
             return new_node if should_keep_this else None
 
+        rel_path = _enrich_resolve_relative_path(node_data, node_name, current_path)
         new_node = {
             "type": "folder",
             "name": node_name,
@@ -233,6 +569,8 @@ def enrich_structure_with_descriptions(
     if enriched_root:
         enriched_root["name"] = "study"
         enriched_root["relative_path"] = "study"
+
+        # When multi_match: include practice content in study space for matching.
         if multi_match:
             _enrich_merge_practice_into_study(enriched_root)
 
@@ -417,11 +755,11 @@ def run_backbone_identification(
     )
 
     result: BackboneResult = gateway.parse_structured(
-        model="gpt-5-mini",
+        model=DEFAULT_LLM_MODEL,
         system_prompt=system_prompt,
         user_payload=descriptions_payload,
         response_model=BackboneResult,
-        seed=42,
+        seed=DEFAULT_LLM_SEED,
     )
     print(f"Identified backbone: {result.backbone_path}")
     return result.backbone_path
@@ -457,58 +795,6 @@ def aggregate_folder_descriptions(node: Dict, max_files: int = 5) -> str:
     return " | ".join(descriptions)
 
 
-def get_folder_candidates(enriched_data: Dict, backbone_path: str) -> List[Dict]:
-    """Identify folders that are candidates for aggregation (orphans only)."""
-    candidates = []
-    backbone_path = _normalize_path(backbone_path)
-
-    def traverse(node: Dict, hierarchy_path: str = ""):
-        name = node.get("name")
-        children = node.get("children", []) or []
-
-        if not name:
-            for child in children:
-                traverse(child, hierarchy_path)
-            return
-
-        node_path = f"{hierarchy_path}/{name}" if hierarchy_path else name
-
-        if _is_under_path(node_path, backbone_path):
-            return
-
-        if _normalize_path(backbone_path).startswith(f"{_normalize_path(node_path)}/"):
-            for child in children:
-                traverse(child, node_path)
-            return
-
-        node_type = node.get("type", "folder")
-
-        if node_type == "folder":
-            file_children = [c.get("name") for c in children if c.get("type") == "file"]
-            folder_children = [c.get("name") for c in children if c.get("type") == "folder"]
-            has_subfolders = len(folder_children) > 0
-
-            if file_children and not has_subfolders:
-                candidates.append(
-                    {
-                        "path": node_path,
-                        "num_files": len(file_children),
-                        "num_subfolders": len(folder_children),
-                        "sample_files": file_children[:5],
-                        "sample_subfolders": folder_children[:5],
-                        "folder_description": aggregate_folder_descriptions(node),
-                    }
-                )
-
-            for child in children:
-                traverse(child, node_path)
-
-    for child in enriched_data.get("children", []) or []:
-        traverse(child)
-
-    return candidates
-
-
 def _orphan_skip_backbone_subtree(node_path: str, backbone_folder: str) -> bool:
     if _normalize_path(node_path) == backbone_folder:
         return True
@@ -525,6 +811,94 @@ def _orphan_leaf_folder_auto_aggregate(node: Dict) -> bool:
         and len(file_children) > 0
         and not is_sequential
     )
+
+
+def _orphan_uniform_attr_in_subtree(node: Dict, attr: str) -> Optional[str]:
+    """Return the single unique value of ``attr`` across all descendant *file* nodes.
+
+    This operates on the enriched tree (folders with ``children`` lists). If no file
+    descendant defines ``attr``, returns None.
+    """
+    seen: set = set()
+    stack = [node]
+    while stack:
+        curr = stack.pop()
+        children = curr.get("children", []) or []
+        for child in reversed(children):
+            t = child.get("type")
+            if t == "file":
+                val = child.get(attr)
+                if val is None or val == "":
+                    continue
+                seen.add(str(val))
+                if len(seen) > 1:
+                    return None
+            elif t == "folder":
+                stack.append(child)
+    return next(iter(seen)) if len(seen) == 1 else None
+
+
+def _orphan_has_mixed_children(node: Dict) -> bool:
+    children = node.get("children", []) or []
+    has_file = any(c.get("type") == "file" for c in children)
+    has_folder = any(c.get("type") == "folder" for c in children)
+    return has_file and has_folder
+
+
+def _orphan_task_instance_folder_auto_aggregate(
+    node: Dict, *, name: str, parent_name: Optional[str]
+) -> bool:
+    """Heuristic: treat a *non-leaf* folder as a single unit when it represents
+    one task instance (e.g., Discussion_10) but still contains helper subfolders
+    like solutions.
+
+    Requirements:
+    - Mixed children (both files and subfolders)
+    - Not a sequence-container folder (by_sequence)
+    - All descendant files share a single ``sequence_name`` matching the folder name
+    - If all descendant files share a single ``task_name``, it must match parent folder
+      name (e.g., parent=discussion, task_name=discussion)
+    """
+    if node.get("by_sequence", False):
+        return False
+    if not _orphan_has_mixed_children(node):
+        return False
+
+    seq = _orphan_uniform_attr_in_subtree(node, "sequence_name")
+    if not seq or seq != name:
+        return False
+
+    task = _orphan_uniform_attr_in_subtree(node, "task_name")
+    if task and parent_name and task.lower() != parent_name.lower():
+        return False
+
+    return True
+
+
+def _orphan_build_subtree_folder_unit_description(node: Dict, max_files: int = 12) -> str:
+    """Like :func:`_orphan_build_leaf_folder_unit_description`, but includes file
+    descendants (not just immediate children) so mixed folders summarize well."""
+    filenames: List[str] = []
+    details: List[str] = []
+    stack = [node]
+    while stack and len(filenames) < max_files:
+        curr = stack.pop()
+        children = curr.get("children", []) or []
+        for child in reversed(children):
+            if child.get("type") == "file":
+                n = child.get("name")
+                if n and n not in filenames and len(filenames) < max_files:
+                    filenames.append(n)
+                d = (child.get("description") or "").strip()
+                if d and len(details) < max_files:
+                    details.append(f"{n}: {d}")
+            elif child.get("type") == "folder":
+                stack.append(child)
+
+    combined_desc = "Folder containing: " + (", ".join(filenames) if filenames else "(no files)")
+    if details:
+        combined_desc += ". Details: " + " | ".join(details)
+    return combined_desc
 
 
 def _orphan_build_leaf_folder_unit_description(node: Dict) -> str:
@@ -593,10 +967,26 @@ def collect_orphan_items(
 
         node_path = f"{hierarchy_path}/{name}" if hierarchy_path else name
 
+        parent_name = hierarchy_path.split("/")[-1] if hierarchy_path else None
+
         if _orphan_skip_backbone_subtree(node_path, backbone_folder):
             return
 
         description = node.get("description", "")
+
+        if node_type == "folder" and _orphan_task_instance_folder_auto_aggregate(
+            node, name=name, parent_name=parent_name
+        ):
+            orphans.append(
+                {
+                    "structure_path": node_path,
+                    "relative_path": node.get("relative_path", node_path),
+                    "name": name,
+                    "type": "folder_unit",
+                    "description": _orphan_build_subtree_folder_unit_description(node),
+                }
+            )
+            return
 
         if node_type == "folder" and _orphan_leaf_folder_auto_aggregate(node):
             _orphan_append_leaf_unit(orphans, node, node_path, name)
@@ -613,10 +1003,15 @@ def collect_orphan_items(
                 traverse(child, node_path)
             return
 
+        disk = (
+            _enriched_file_disk_path(node)
+            if node_type == "file"
+            else node.get("relative_path", node_path)
+        )
         orphans.append(
             {
                 "structure_path": node_path,
-                "relative_path": node.get("relative_path", node_path),
+                "relative_path": disk or node_path,
                 "name": name,
                 "type": node_type,
                 "description": description,
@@ -914,19 +1309,3 @@ def generate_rearrangement_plan(
     return final_plan
 
 
-def merge_matches_into_groups(
-    groups: List[BackboneGroup],
-    matches: OrphanMatchResponse,
-    *,
-    llm_gateway: Optional[LLMGateway] = None,
-) -> List[RearrangedGroup]:
-    """Merge orphan matches into backbone groups, producing RearrangedGroups."""
-    plan_dicts = generate_rearrangement_plan(groups, matches, llm_gateway=llm_gateway)
-    return [
-        RearrangedGroup(
-            group_name=p["group_name"],
-            main_item=p["main_item"],
-            related_items=p["related_items"],
-        )
-        for p in plan_dicts
-    ]
