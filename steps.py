@@ -10,6 +10,7 @@ Sections (in pipeline order):
 import json
 import re
 import sqlite3
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -333,6 +334,12 @@ def merge_final_paths_into_tree(tree: Dict, final_paths_doc: Dict) -> Dict:
     Retained so existing imports keep working. The rebuilt tree is returned;
     the input ``tree`` argument is no longer mutated.
     """
+    warnings.warn(
+        "merge_final_paths_into_tree is deprecated; "
+        "use reorganize_tree_by_final_paths (or build_tree_from_final_paths) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return reorganize_tree_by_final_paths(tree, final_paths_doc)
 
 
@@ -563,8 +570,10 @@ def enrich_structure_with_descriptions(
         return None
 
     root_name = input_data.get("name", "root")
-    enriched_root = process_node(input_data, root_name, "")
-    conn.close()
+    try:
+        enriched_root = process_node(input_data, root_name, "")
+    finally:
+        conn.close()
 
     if enriched_root:
         enriched_root["name"] = "study"

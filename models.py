@@ -23,16 +23,6 @@ class BackboneGroup(BaseModel):
     description: str
 
 
-class BackboneGroupsResponse(BaseModel):
-    groups: List[BackboneGroup]
-
-
-class RearrangedGroup(BaseModel):
-    group_name: str
-    main_item: str
-    related_items: List[str]
-
-
 class OrphanMatch(BaseModel):
     item_path: str
     assigned_group: str
@@ -50,10 +40,6 @@ class MiscGroupAssignment(BaseModel):
 
 class MiscRefinementResponse(BaseModel):
     assignments: List[MiscGroupAssignment]
-
-
-class AggregationDecision(BaseModel):
-    paths_to_aggregate: List[str]
 
 
 @dataclass(frozen=True)

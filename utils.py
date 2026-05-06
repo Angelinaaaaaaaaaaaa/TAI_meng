@@ -167,7 +167,10 @@ def _derive_course_name(
 # LLM gateway
 # =============================================================================
 
-DEFAULT_LLM_MODEL = "gpt-5-mini"
+# Pinned to match Step 1 (`bfs_v4.py`, `classify_v4.py`) — using the unversioned
+# alias would let OpenAI swap underlying weights mid-experiment and break the
+# determinism we get from `seed=DEFAULT_LLM_SEED`.
+DEFAULT_LLM_MODEL = "gpt-5-mini-2025-08-07"
 DEFAULT_LLM_SEED = 42
 
 
