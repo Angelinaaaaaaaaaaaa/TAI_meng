@@ -297,6 +297,39 @@ def load_tree_json_records(json_path: str) -> tuple[list[dict], dict[str, list[s
     return file_records, deduped_folder_groups
 
 
+def load_final_paths_records(json_path: str) -> list[dict]:
+    with open(json_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if isinstance(data, dict):
+        records = data.get("all_final_paths", [])
+    elif isinstance(data, list):
+        records = data
+    else:
+        raise ValueError("Expected final paths JSON to be a dict or list.")
+
+    out = []
+    for record in records:
+        source = normalize_slash_path(record.get("source"))
+        final_path = normalize_slash_path(record.get("final_path"))
+        if not source or not final_path:
+            continue
+        out.append(
+            {
+                "source": source,
+                "final_path": safe_relative_output_path(final_path),
+                "file_hash": record.get("file_hash") or "",
+                "file_name": record.get("file_name") or os.path.basename(final_path),
+                "description": record.get("description"),
+                "category": record.get("category"),
+                "task_name": record.get("task_name"),
+                "sequence_name": record.get("sequence_name"),
+            }
+        )
+
+    return out
+
+
 def dedupe_file_records_by_final_path(file_records: list[dict]) -> tuple[list[dict], int]:
     seen = set()
     deduped = []
@@ -311,6 +344,455 @@ def dedupe_file_records_by_final_path(file_records: list[dict]) -> tuple[list[di
         deduped.append(record)
 
     return deduped, skipped
+
+
+def top_level_path_part(path: str) -> str:
+    parts = normalize_slash_path(path).split("/")
+    return parts[0].lower() if parts and parts[0] else ""
+
+
+def parse_category_filter(raw_categories: str | None) -> set[str] | None:
+    if raw_categories is None:
+        return None
+
+    categories = {
+        category.strip().lower()
+        for category in raw_categories.split(",")
+        if category.strip()
+    }
+    return categories or None
+
+
+def filter_records_by_top_level_category(
+    file_records: list[dict],
+    allowed_categories: set[str] | None,
+) -> tuple[list[dict], int]:
+    if not allowed_categories:
+        return file_records, 0
+
+    filtered = [
+        record
+        for record in file_records
+        if top_level_path_part(record.get("final_path", "")) in allowed_categories
+    ]
+    return filtered, len(file_records) - len(filtered)
+
+
+def plan_source_prefix_candidates(plan_key: str) -> list[str]:
+    plan_key = normalize_slash_path(plan_key)
+    parts = [part for part in plan_key.split("/") if part]
+    candidates = [plan_key]
+
+    if len(parts) >= 2 and parts[0].lower() == "study":
+        content_kind = parts[1].lower()
+        if content_kind in {"lab", "homework", "project"}:
+            candidates.append(
+                normalize_slash_path("/".join(["practice", *parts[1:]]))
+            )
+
+    if parts:
+        root_aliases = {
+            "hw": "homework",
+            "homework": "homework",
+            "lab": "lab",
+            "project": "project",
+            "proj": "project",
+        }
+        root_alias = root_aliases.get(parts[0].lower())
+        if root_alias:
+            candidates.append(
+                normalize_slash_path("/".join(["practice", root_alias, *parts[1:]]))
+            )
+
+    seen = set()
+    return [c for c in candidates if c and not (c in seen or seen.add(c))]
+
+
+def records_under_plan_prefix(
+    file_records: list[dict],
+    plan_key: str,
+    allowed_categories: set[str] | None,
+    allow_cross_category_sources: bool = False,
+) -> list[tuple[dict, str]]:
+    source_prefixes = (
+        plan_source_prefix_candidates(plan_key)
+        if allow_cross_category_sources
+        else [normalize_slash_path(plan_key)]
+    )
+    matches = []
+
+    for record in file_records:
+        final_path = normalize_slash_path(record.get("final_path", ""))
+        source_path = normalize_slash_path(record.get("source", ""))
+        if (
+            allowed_categories
+            and not allow_cross_category_sources
+            and top_level_path_part(final_path) not in allowed_categories
+        ):
+            continue
+
+        for source_prefix in source_prefixes:
+            if final_path == source_prefix:
+                matches.append((record, ""))
+                break
+            if final_path.startswith(source_prefix + "/"):
+                matches.append((record, final_path[len(source_prefix) + 1 :]))
+                break
+            if source_path == source_prefix:
+                matches.append((record, ""))
+                break
+            if source_path.startswith(source_prefix + "/"):
+                matches.append((record, source_path[len(source_prefix) + 1 :]))
+                break
+
+    if not matches:
+        plan_basename = os.path.basename(normalize_slash_path(plan_key)).lower()
+        if os.path.splitext(plan_basename)[1]:
+            for record in file_records:
+                final_path = normalize_slash_path(record.get("final_path", ""))
+                source_path = normalize_slash_path(record.get("source", ""))
+                if (
+                    allowed_categories
+                    and not allow_cross_category_sources
+                    and top_level_path_part(final_path) not in allowed_categories
+                ):
+                    continue
+
+                if (
+                    os.path.basename(final_path).lower() == plan_basename
+                    or os.path.basename(source_path).lower() == plan_basename
+                ):
+                    matches.append((record, ""))
+
+    return matches
+
+
+def build_plan_mapped_final_path_records(
+    module: ModuleType,
+    source_records: list[dict],
+    allowed_categories: set[str] | None,
+    allow_cross_category_sources: bool = False,
+) -> tuple[list[dict], int]:
+    item_groups = build_json_plan_item_groups(module, allowed_categories)
+    mapped_records = []
+    matched_plan_items = 0
+
+    for plan_key, info in item_groups.items():
+        output_paths = info["output_paths"]
+        if not output_paths:
+            continue
+
+        matches = records_under_plan_prefix(
+            source_records,
+            plan_key,
+            allowed_categories,
+            allow_cross_category_sources=allow_cross_category_sources,
+        )
+        if not matches:
+            continue
+
+        matched_plan_items += 1
+        for output_path in output_paths:
+            output_prefix = module_normalize_path(module, output_path)
+            for record, suffix in matches:
+                if suffix:
+                    final_path = module_normalize_path(
+                        module,
+                        "/".join([output_prefix, suffix]),
+                    )
+                else:
+                    final_path = output_prefix
+
+                mapped = dict(record)
+                mapped["final_path"] = safe_relative_output_path(final_path)
+                mapped_records.append(mapped)
+
+    return mapped_records, matched_plan_items
+
+
+def materialize_plan_source_index_tree(
+    module: ModuleType,
+    source_records: list[dict],
+    allowed_categories: set[str] | None,
+    source_root: str,
+    output_root: str,
+    allow_cross_category_sources: bool = False,
+) -> dict:
+    os.makedirs(output_root, exist_ok=True)
+
+    item_groups = build_json_plan_item_groups(module, allowed_categories)
+    basename_index = build_source_basename_index(source_root)
+    hash_index = None
+    copied_files = 0
+    linked_files = 0
+    linked_folders = 0
+    missing_sources = []
+    matched_items = 0
+
+    for plan_key, info in item_groups.items():
+        output_paths = info["output_paths"]
+        if not output_paths:
+            continue
+
+        matches = records_under_plan_prefix(
+            source_records,
+            plan_key,
+            allowed_categories,
+            allow_cross_category_sources=allow_cross_category_sources,
+        )
+        if not matches:
+            continue
+
+        matched_items += 1
+        is_folder_item = info["is_folder"]
+        canonical_rel = module_normalize_path(module, output_paths[0])
+        canonical_abs = os.path.abspath(os.path.join(output_root, canonical_rel))
+
+        if is_folder_item:
+            remove_existing_output_path(canonical_abs)
+            os.makedirs(canonical_abs, exist_ok=True)
+
+            for record, suffix in matches:
+                source_abs = resolve_tree_record_source(
+                    source_root,
+                    record,
+                    basename_index,
+                    hash_index=hash_index,
+                )
+                if source_abs is None and record.get("file_hash"):
+                    if hash_index is None:
+                        hash_index = build_source_hash_index(source_root)
+                    source_abs = resolve_tree_record_source(
+                        source_root,
+                        record,
+                        basename_index,
+                        hash_index=hash_index,
+                    )
+                if source_abs is None:
+                    missing_sources.append(record["source"])
+                    continue
+
+                target_suffix = suffix or os.path.basename(record["final_path"])
+                dst_abs = os.path.abspath(os.path.join(canonical_abs, target_suffix))
+                if copy_physical_item(source_abs, dst_abs, output_root):
+                    copied_files += 1
+        else:
+            record, _ = matches[0]
+            source_abs = resolve_tree_record_source(
+                source_root,
+                record,
+                basename_index,
+                hash_index=hash_index,
+            )
+            if source_abs is None and record.get("file_hash"):
+                if hash_index is None:
+                    hash_index = build_source_hash_index(source_root)
+                source_abs = resolve_tree_record_source(
+                    source_root,
+                    record,
+                    basename_index,
+                    hash_index=hash_index,
+                )
+            if source_abs is None:
+                missing_sources.append(record["source"])
+                continue
+
+            if copy_physical_item(source_abs, canonical_abs, output_root):
+                copied_files += 1
+
+        for output_path in output_paths[1:]:
+            dst_abs = os.path.abspath(os.path.join(output_root, output_path))
+            if replace_with_symlink(
+                src_abs=canonical_abs,
+                dst_abs=dst_abs,
+                root_dir=output_root,
+                target_is_directory=is_folder_item,
+            ):
+                if is_folder_item:
+                    linked_folders += 1
+                else:
+                    linked_files += 1
+
+    return {
+        "matched_items": matched_items,
+        "copied_files": copied_files,
+        "file_symlinks": linked_files,
+        "folder_symlinks": linked_folders,
+        "missing_sources": missing_sources,
+        "folder_groups": len(item_groups),
+    }
+
+
+def insert_final_path_records_into_table(
+    db_path: str,
+    output_table: str,
+    file_records: list[dict],
+) -> int:
+    conn = sqlite3.connect(db_path)
+    inserted = 0
+
+    try:
+        cur = conn.cursor()
+        columns = [row[1] for row in cur.execute(f"PRAGMA table_info({output_table})")]
+
+        if not columns:
+            raise ValueError(f"Output table does not exist: {output_table}")
+
+        path_col = "file_path" if "file_path" in columns else "logical_path"
+        existing_paths = {
+            row[0]
+            for row in cur.execute(f"SELECT {path_col} FROM {output_table}")
+            if row[0]
+        }
+
+        insert_columns = columns
+        placeholders = ", ".join("?" for _ in insert_columns)
+        quoted_columns = ", ".join(insert_columns)
+        quoted_table = '"' + output_table.replace('"', '""') + '"'
+
+        for index, record in enumerate(file_records, start=1):
+            final_path = record["final_path"]
+            if final_path in existing_paths:
+                continue
+            stable_id = hashlib.sha1(
+                final_path.encode("utf-8", errors="surrogatepass")
+            ).hexdigest()[:24]
+
+            values_by_col = {
+                "uuid": f"final-path-{stable_id}",
+                "source_uuid": f"final-path-source-{stable_id}",
+                "file_hash": record.get("file_hash") or "",
+                "relative_path": record.get("source"),
+                "file_name": record.get("file_name"),
+                "url": None,
+                "logical_path": final_path,
+                "file_path": final_path,
+                "original_path": record.get("source"),
+                "lecture_numbers": "[]",
+                "description": record.get("description"),
+                "extra_info": json.dumps(
+                    {
+                        "category": record.get("category"),
+                        "task_name": record.get("task_name"),
+                        "sequence_name": record.get("sequence_name"),
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+            values = [values_by_col.get(col) for col in insert_columns]
+            cur.execute(
+                f"INSERT INTO {quoted_table} ({quoted_columns}) VALUES ({placeholders})",
+                values,
+            )
+            existing_paths.add(final_path)
+            inserted += 1
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return inserted
+
+
+def delete_table_rows_outside_top_level_categories(
+    db_path: str,
+    output_table: str,
+    allowed_categories: set[str] | None,
+    preserve_categories: set[str] | None = None,
+) -> int:
+    if not allowed_categories:
+        return 0
+
+    preserve_categories = preserve_categories or set()
+    keep_categories = allowed_categories | preserve_categories
+    conn = sqlite3.connect(db_path)
+    deleted = 0
+
+    try:
+        cur = conn.cursor()
+        columns = [row[1] for row in cur.execute(f"PRAGMA table_info({output_table})")]
+        if not columns:
+            raise ValueError(f"Output table does not exist: {output_table}")
+
+        path_col = "file_path" if "file_path" in columns else "logical_path"
+        uuid_col = "uuid" if "uuid" in columns else None
+        if uuid_col is None:
+            raise ValueError(f"Output table has no uuid column: {output_table}")
+
+        quoted_table = '"' + output_table.replace('"', '""') + '"'
+        quoted_path_col = '"' + path_col.replace('"', '""') + '"'
+        quoted_uuid_col = '"' + uuid_col.replace('"', '""') + '"'
+        rows = cur.execute(
+            f"SELECT {quoted_uuid_col}, {quoted_path_col} FROM {quoted_table}"
+        ).fetchall()
+
+        uuids_to_delete = [
+            uuid
+            for uuid, path in rows
+            if top_level_path_part(path or "") not in keep_categories
+        ]
+
+        for uuid in uuids_to_delete:
+            cur.execute(
+                f"DELETE FROM {quoted_table} WHERE {quoted_uuid_col} = ?",
+                (uuid,),
+            )
+            deleted += 1
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return deleted
+
+
+def delete_table_rows_inside_top_level_categories(
+    db_path: str,
+    output_table: str,
+    categories: set[str] | None,
+) -> int:
+    if not categories:
+        return 0
+
+    conn = sqlite3.connect(db_path)
+    deleted = 0
+
+    try:
+        cur = conn.cursor()
+        columns = [row[1] for row in cur.execute(f"PRAGMA table_info({output_table})")]
+        if not columns:
+            raise ValueError(f"Output table does not exist: {output_table}")
+
+        path_col = "file_path" if "file_path" in columns else "logical_path"
+        uuid_col = "uuid" if "uuid" in columns else None
+        if uuid_col is None:
+            raise ValueError(f"Output table has no uuid column: {output_table}")
+
+        quoted_table = '"' + output_table.replace('"', '""') + '"'
+        quoted_path_col = '"' + path_col.replace('"', '""') + '"'
+        quoted_uuid_col = '"' + uuid_col.replace('"', '""') + '"'
+        rows = cur.execute(
+            f"SELECT {quoted_uuid_col}, {quoted_path_col} FROM {quoted_table}"
+        ).fetchall()
+
+        uuids_to_delete = [
+            uuid
+            for uuid, path in rows
+            if top_level_path_part(path or "") in categories
+        ]
+
+        for uuid in uuids_to_delete:
+            cur.execute(
+                f"DELETE FROM {quoted_table} WHERE {quoted_uuid_col} = ?",
+                (uuid,),
+            )
+            deleted += 1
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return deleted
 
 
 def resolve_tree_source(source_root: str, source: str) -> str:
@@ -584,8 +1066,28 @@ def run_tree_json_mode(
 
 
 def plan_item_key(module: ModuleType, plan_item: str) -> str:
-    stripped = strip_first_path_part(module, plan_item)
-    return module_normalize_path(module, stripped or plan_item)
+    parts = path_parts(module, plan_item)
+    known_roots = {
+        "study",
+        "practice",
+        "support",
+        "youtube",
+        "slides",
+        "discussion",
+        "disc",
+        "homework",
+        "hw",
+        "lab",
+        "project",
+        "proj",
+        "assets",
+        "textbook",
+    }
+
+    if len(parts) > 1 and parts[0].lower() not in known_roots:
+        return module_normalize_path(module, "/".join(parts[1:]))
+
+    return module_normalize_path(module, plan_item)
 
 
 def candidate_output_paths(module: ModuleType, plan_item: str, group: dict) -> list[str]:
@@ -631,10 +1133,30 @@ def first_existing_source_path(
             return candidate
         if not is_folder and os.path.isfile(candidate):
             return candidate
+
+    root = getattr(module, "ORIGINAL_ROOT", "")
+    basename = os.path.basename(module_normalize_path(module, plan_key)).lower()
+    matches = []
+
+    if not basename or not os.path.isdir(root):
+        return None
+
+    for walk_root, dirs, files in os.walk(root):
+        names = dirs if is_folder else files
+        for name in names:
+            if name.lower() == basename:
+                matches.append(os.path.join(walk_root, name))
+
+    if len(matches) == 1:
+        return matches[0]
+
     return None
 
 
-def build_json_plan_item_groups(module: ModuleType) -> dict[str, dict]:
+def build_json_plan_item_groups(
+    module: ModuleType,
+    allowed_categories: set[str] | None = None,
+) -> dict[str, dict]:
     if not os.path.exists(module.JSON_PATH):
         return {}
 
@@ -662,6 +1184,12 @@ def build_json_plan_item_groups(module: ModuleType) -> dict[str, dict]:
 
             is_folder = not is_file_like_plan_path(module, plan_item)
             output_paths = candidate_output_paths(module, plan_item, group)
+            if allowed_categories:
+                output_paths = [
+                    output_path
+                    for output_path in output_paths
+                    if top_level_path_part(output_path) in allowed_categories
+                ]
             if not output_paths:
                 continue
 
@@ -681,8 +1209,11 @@ def build_json_plan_item_groups(module: ModuleType) -> dict[str, dict]:
     return item_groups
 
 
-def materialize_json_plan_item_tree(module: ModuleType) -> None:
-    item_groups = build_json_plan_item_groups(module)
+def materialize_json_plan_item_tree(
+    module: ModuleType,
+    allowed_categories: set[str] | None = None,
+) -> None:
+    item_groups = build_json_plan_item_groups(module, allowed_categories)
 
     if getattr(module, "CLEAR_LOGICAL_ROOT_FIRST", False):
         print(f"Clearing logical root: {module.LOGICAL_ROOT}")
@@ -737,6 +1268,147 @@ def materialize_json_plan_item_tree(module: ModuleType) -> None:
         print(f"JSON item sources missing: {len(missing_sources)}")
         for plan_key in missing_sources[:12]:
             print(f"  MISSING: {plan_key}")
+
+
+def run_plan_json_mode(
+    module: ModuleType,
+    plan_json: str,
+    source_root: str,
+    output_root: str,
+    output_db: str,
+    output_table: str,
+    final_paths_json: str | None = None,
+    final_path_categories: set[str] | None = None,
+    plan_categories: set[str] | None = None,
+) -> None:
+    source_root_abs = os.path.abspath(source_root)
+    output_root_abs = os.path.abspath(output_root)
+    output_db_abs = os.path.abspath(output_db)
+    original_db_path = module.DB_PATH
+
+    if not os.path.isdir(source_root_abs):
+        raise FileNotFoundError(f"Source dataset folder not found: {source_root_abs}")
+
+    if is_inside_directory(output_root_abs, source_root_abs):
+        raise ValueError("Output folder cannot be inside the source dataset folder.")
+
+    os.makedirs(os.path.dirname(output_db_abs), exist_ok=True)
+    if os.path.abspath(original_db_path) != output_db_abs:
+        shutil.copy2(original_db_path, output_db_abs)
+
+    module.JSON_PATH = os.path.abspath(plan_json)
+    module.DB_PATH = output_db_abs
+    module.ORIGINAL_ROOT = source_root_abs
+    module.LOGICAL_ROOT = output_root_abs
+    module.NEW_TABLE = output_table
+    module.CREATE_LOGICAL_OUTPUT = False
+    module.CLEAR_LOGICAL_ROOT_FIRST = True
+
+    module.main()
+
+    deleted_by_plan_category = delete_table_rows_outside_top_level_categories(
+        db_path=output_db_abs,
+        output_table=output_table,
+        allowed_categories=plan_categories,
+        preserve_categories={"original"},
+    )
+    if plan_categories:
+        print(f"metadata_rows_removed_by_plan_category: {deleted_by_plan_category}")
+
+    if final_paths_json:
+        if os.path.isdir(output_root_abs):
+            shutil.rmtree(output_root_abs)
+        os.makedirs(output_root_abs, exist_ok=True)
+
+        all_final_path_records = load_final_paths_records(final_paths_json)
+        final_path_records = all_final_path_records
+        final_path_records, skipped_final_path_categories = (
+            filter_records_by_top_level_category(
+                final_path_records,
+                final_path_categories,
+            )
+        )
+        final_path_records, skipped_duplicate_final_paths = (
+            dedupe_file_records_by_final_path(final_path_records)
+        )
+        final_summary = materialize_tree_records(
+            file_records=final_path_records,
+            folder_groups={},
+            source_root=source_root_abs,
+            output_root=output_root_abs,
+        )
+        inserted = insert_final_path_records_into_table(
+            db_path=output_db_abs,
+            output_table=output_table,
+            file_records=final_path_records,
+        )
+
+        print("Final paths JSON materialization complete.")
+        print(f"final_path_records: {len(final_path_records)}")
+        print(f"final_paths_skipped_by_category: {skipped_final_path_categories}")
+        print(f"duplicate_final_paths_skipped: {skipped_duplicate_final_paths}")
+        print(f"metadata_rows_inserted_from_final_paths: {inserted}")
+        for key, value in final_summary.items():
+            if key == "missing_sources":
+                print(f"final_paths_missing_sources: {len(value)}")
+                for item in value[:12]:
+                    print(f"  MISSING: {item}")
+            else:
+                print(f"final_paths_{key}: {value}")
+
+        if plan_categories:
+            plan_mapped_records, matched_plan_items = (
+                build_plan_mapped_final_path_records(
+                    module=module,
+                    source_records=all_final_path_records,
+                    allowed_categories=plan_categories,
+                    allow_cross_category_sources=True,
+                )
+            )
+            plan_mapped_records, skipped_duplicate_plan_paths = (
+                dedupe_file_records_by_final_path(plan_mapped_records)
+            )
+            deleted_plan_rows = delete_table_rows_inside_top_level_categories(
+                db_path=output_db_abs,
+                output_table=output_table,
+                categories=plan_categories,
+            )
+            plan_inserted = insert_final_path_records_into_table(
+                db_path=output_db_abs,
+                output_table=output_table,
+                file_records=plan_mapped_records,
+            )
+            plan_summary = materialize_plan_source_index_tree(
+                module=module,
+                source_records=all_final_path_records,
+                allowed_categories=plan_categories,
+                source_root=source_root_abs,
+                output_root=output_root_abs,
+                allow_cross_category_sources=True,
+            )
+
+            print("Plan categories materialized from final-path source index.")
+            print(f"plan_source_index_matched_items: {matched_plan_items}")
+            print(f"plan_source_index_records: {len(plan_mapped_records)}")
+            print(f"plan_source_index_duplicate_paths_skipped: {skipped_duplicate_plan_paths}")
+            print(f"metadata_rows_removed_for_plan_categories: {deleted_plan_rows}")
+            print(f"metadata_rows_inserted_for_plan_categories: {plan_inserted}")
+            for key, value in plan_summary.items():
+                if key == "missing_sources":
+                    print(f"plan_source_index_missing_sources: {len(value)}")
+                    for item in value[:12]:
+                        print(f"  MISSING: {item}")
+                else:
+                    print(f"plan_source_index_{key}: {value}")
+
+        module.CLEAR_LOGICAL_ROOT_FIRST = False
+
+    if not (final_paths_json and plan_categories):
+        materialize_json_plan_item_tree(module, allowed_categories=plan_categories)
+
+    print("Plan JSON run complete.")
+    print(f"Output DB: {output_db_abs}")
+    print(f"Output folder: {output_root_abs}")
 
 
 class CS61ARunner:
@@ -981,6 +1653,34 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--plan-json",
+        help=(
+            "Run from a pre-refinement plan JSON containing group_name, "
+            "main_item, and related_items fields."
+        ),
+    )
+    parser.add_argument(
+        "--final-paths-json",
+        help=(
+            "Optional BFS final paths JSON with all_final_paths records. "
+            "Used with --plan-json to materialize study/practice/support files."
+        ),
+    )
+    parser.add_argument(
+        "--final-path-categories",
+        help=(
+            "Comma-separated top-level categories to keep from --final-paths-json, "
+            "for example practice,support. Defaults to all categories."
+        ),
+    )
+    parser.add_argument(
+        "--plan-categories",
+        help=(
+            "Comma-separated top-level categories to materialize from --plan-json, "
+            "for example study. Defaults to all categories."
+        ),
+    )
+    parser.add_argument(
         "--source-root",
         help="Original unstructured dataset root to read from in --tree-json mode.",
     )
@@ -1006,6 +1706,9 @@ def main() -> None:
         create_folder_symlinks=not args.no_folder_symlinks,
     )
 
+    if args.tree_json and args.plan_json:
+        raise ValueError("Use only one of --tree-json or --plan-json.")
+
     if args.tree_json:
         missing = [
             name
@@ -1028,6 +1731,34 @@ def main() -> None:
             output_root=args.logical_root,
             output_db=args.db_output,
             output_table=args.tree_output_table,
+        )
+        return
+
+    if args.plan_json:
+        missing = [
+            name
+            for name, value in {
+                "--source-root": args.source_root,
+                "--logical-root": args.logical_root,
+                "--db-output": args.db_output,
+            }.items()
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "--plan-json mode requires " + ", ".join(missing)
+            )
+
+        run_plan_json_mode(
+            module=runner.module,
+            plan_json=args.plan_json,
+            source_root=args.source_root,
+            output_root=args.logical_root,
+            output_db=args.db_output,
+            output_table=args.output_table,
+            final_paths_json=args.final_paths_json,
+            final_path_categories=parse_category_filter(args.final_path_categories),
+            plan_categories=parse_category_filter(args.plan_categories),
         )
         return
 
