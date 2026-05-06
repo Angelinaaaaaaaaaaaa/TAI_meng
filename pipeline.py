@@ -368,10 +368,6 @@ def run_plan_matching(
     return matches, plan
 
 
-def run_file_rearrangement(orphan_matches: OrphanMatchResponse, enriched_data: Dict):
-    """Placeholder for file rearrangement — not implemented yet."""
-    raise NotImplementedError("File rearrangement is not yet implemented.")
-
 
 # =============================================================================
 # 3. Tree builder

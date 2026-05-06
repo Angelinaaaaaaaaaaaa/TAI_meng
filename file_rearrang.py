@@ -33,7 +33,6 @@ from pipeline import (  # noqa: F401
     main,
     parse_cli_args,
     run_enrichment,
-    run_file_rearrangement,
     run_pipeline_cli,
     run_plan_matching,
     run_tree_step,
