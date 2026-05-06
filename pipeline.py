@@ -18,9 +18,9 @@ Layout per run:
 
 import argparse
 import json
+import logging
 import sqlite3
 import sys
-import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -48,7 +48,7 @@ from utils import (
     _chunked,
     _derive_course_name,
     _detect_course_prefix,
-    _safe_print,
+    configure_cli_logging,
     load_json_file,
     reset_pipeline_log_dir,
     save_debug_log,
@@ -56,6 +56,8 @@ from utils import (
 )
 
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
 
@@ -169,10 +171,10 @@ def run_enrichment(
     output_dir.mkdir(parents=True, exist_ok=True)
     enriched_output = output_dir / "study_enriched.json"
 
-    print("=" * 60)
-    print(f"Preprocessing: Enriching structure for course '{course_name}'")
-    print("=" * 60)
-    print(f"Database path: {db_file}")
+    log.info("=" * 60)
+    log.info("Preprocessing: Enriching structure for course '%s'", course_name)
+    log.info("=" * 60)
+    log.info("Database path: %s", db_file)
 
     pre_built: Optional[Dict] = None
     input_file_for_log: Optional[Path] = None
@@ -192,27 +194,27 @@ def run_enrichment(
             tree_file = _resolve_input_path(base, input_filename)
             if not tree_file.exists():
                 raise FileNotFoundError(f"--input file not found: {tree_file}")
-            print(f"Input tree:      {tree_file}")
-            print(f"Final-paths doc: {final_paths_file}")
+            log.info("Input tree:      %s", tree_file)
+            log.info("Final-paths doc: %s", final_paths_file)
             raw_tree = load_json_file(tree_file)
             pre_built = reorganize_tree_by_final_paths(raw_tree, final_paths_doc)
             input_file_for_log = tree_file
         else:
             # Only final-paths: build from scratch (no first-pass tree available).
-            print(f"Final-paths doc: {final_paths_file}")
+            log.info("Final-paths doc: %s", final_paths_file)
             pre_built = build_tree_from_final_paths(final_paths_doc)
             input_file_for_log = final_paths_file
 
         out = output_dir / "v4_tree_reorganized.json"
         _write_json(out, pre_built, indent=2)
-        print(f"Reorganized tree saved to: {out}")
+        log.info("Reorganized tree saved to: %s", out)
     else:
         if not input_filename:
             raise ValueError(
                 "Either --input or --final-paths must be provided for the 'enrich' step."
             )
         input_file_for_log = _resolve_input_path(base, input_filename)
-        print(f"Input file path: {input_file_for_log}")
+        log.info("Input file path: %s", input_file_for_log)
 
     return enrich_structure_with_descriptions(
         str(input_file_for_log) if input_file_for_log else "",
@@ -293,22 +295,22 @@ def run_plan_matching(
     save_debug_log(backbone_subtree, "02_1_backbone_subtree")
     backbone_groups = _make_backbone_groups(backbone_subtree)
 
-    print(f"Generated {len(backbone_groups)} backbone groups.")
+    log.info("Generated %d backbone groups.", len(backbone_groups))
     save_debug_log([g.model_dump() for g in backbone_groups], "02_2_backbone_groups")
 
     # --- Step B: Collect orphans and match ---
     orphans = collect_orphan_items(enriched_data, backbone_path, [])
-    print(f"Identified {len(orphans)} orphan items needing placement.")
+    log.info("Identified %d orphan items needing placement.", len(orphans))
     save_debug_log(orphans, "02_3_orphans_collected")
 
     if not orphans:
-        print("No orphans detected.")
+        log.info("No orphans detected.")
         empty = OrphanMatchResponse(matches=[])
         return empty, generate_rearrangement_plan(backbone_groups, empty, llm_gateway=gateway)
 
-    print("Sample orphans:")
+    log.info("Sample orphans:")
     for o in orphans[:5]:
-        _safe_print(f" - {o['name']} ({o['type']})")
+        log.info(" - %s (%s)", o["name"], o["type"])
 
     groups_summary = build_summary(backbone_groups)
 
@@ -316,13 +318,13 @@ def run_plan_matching(
     chunk_size = 50
     total_orphans = len(orphans)
     total_batches = (total_orphans + chunk_size - 1) // chunk_size
-    print(f"Processing {total_orphans} orphans in {total_batches} batches of {chunk_size}...")
+    log.info("Processing %d orphans in %d batches of %d...", total_orphans, total_batches, chunk_size)
 
     system_prompt = _build_matching_system_prompt(backbone_path, multi_match)
     batch_failures = 0
 
     for batch_index, batch_orphans in enumerate(_chunked(orphans, chunk_size), start=1):
-        print(f"Processing batch {batch_index} / {total_batches}...")
+        log.info("Processing batch %d / %d...", batch_index, total_batches)
 
         try:
             batch_result = gateway.parse_structured(
@@ -340,18 +342,26 @@ def run_plan_matching(
             filtered_matches = _filter_matches(batch_result, batch_orphans)
             if filtered_matches:
                 all_matches.extend(filtered_matches)
-                print(f"  - Matched {len(filtered_matches)} valid items in this batch.")
+                log.info("  - Matched %d valid items in this batch.", len(filtered_matches))
             else:
-                print("  - Warning: No matches returned for this batch.")
+                log.warning("No matches returned for batch %d.", batch_index)
 
         except Exception as e:
             batch_failures += 1
-            _safe_print(f"  - Error processing batch {batch_index}: {e}")
+            # Full traceback on first failure (root-cause diagnostic); subsequent
+            # failures get a one-liner to avoid 50× traceback spam on a global outage.
+            if batch_failures == 1:
+                log.exception("Error processing batch %d (showing traceback for first failure only):", batch_index)
+            else:
+                log.error("Error processing batch %d: %s: %s", batch_index, type(e).__name__, e)
 
     if batch_failures:
-        _safe_print(
-            f"WARNING: {batch_failures}/{total_batches} batches failed; "
-            f"matched {len(all_matches)}/{total_orphans} orphans before fallback."
+        log.warning(
+            "%d/%d batches failed; matched %d/%d orphans before fallback.",
+            batch_failures,
+            total_batches,
+            len(all_matches),
+            total_orphans,
         )
         if batch_failures == total_batches:
             raise RuntimeError(
@@ -361,12 +371,16 @@ def run_plan_matching(
     matches = OrphanMatchResponse(matches=all_matches)
     unmatched_added = _append_unmatched_orphans_to_misc(orphans, matches.matches)
     if unmatched_added:
-        print(f"Added {unmatched_added} unmatched orphan items to 'Lecture Miscellaneous'.")
-    print(f"Matched total of {len(matches.matches)} orphan items to groups.")
+        log.warning("Added %d unmatched orphan items to 'Lecture Miscellaneous'.", unmatched_added)
+    log.info("Matched total of %d orphan items to groups.", len(matches.matches))
 
     plan = generate_rearrangement_plan(backbone_groups, matches, llm_gateway=gateway)
     return matches, plan
 
+
+def run_file_rearrangement(orphan_matches: OrphanMatchResponse, enriched_data: Dict):
+    """Placeholder for file rearrangement — not implemented yet."""
+    raise NotImplementedError("File rearrangement is not yet implemented.")
 
 
 # =============================================================================
@@ -377,7 +391,7 @@ def load_file_hashes(db_path: PathLike) -> Dict[str, str]:
     """Load all file hashes from the database into a dict keyed by relative_path."""
     db = Path(db_path)
     if not db.exists():
-        print(f"Warning: Database not found at {db}. Hashes will be empty.")
+        log.warning("Database not found at %s. Hashes will be empty.", db)
         return {}
 
     conn = sqlite3.connect(str(db))
@@ -398,12 +412,12 @@ def load_file_hashes(db_path: PathLike) -> Dict[str, str]:
             if filename:
                 result[f"__NAME__{filename}"] = h
 
-        print(f"Loaded {len(rows)} file rows from database. Lookup map size: {len(result)}")
+        log.info("Loaded %d file rows from database. Lookup map size: %d", len(rows), len(result))
         if course_prefix:
-            print(f"Detected course prefix: '{course_prefix}'")
+            log.info("Detected course prefix: '%s'", course_prefix)
         return result
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        log.error("Database error: %s", e, exc_info=True)
         return {}
     finally:
         conn.close()
@@ -512,13 +526,7 @@ def _build_group_node(
             group_node["children"].append(build_node_recursive(original_node, hash_map))
             continue
 
-        try:
-            print(f"Warning: Item not found in enriched data: {item_path}")
-        except UnicodeEncodeError:
-            print(
-                "Warning: Item not found in enriched data: "
-                + item_path.encode("ascii", "replace").decode("ascii")
-            )
+        log.warning("Item not found in enriched data: %s", item_path)
 
         basename = Path(item_path).name
         fallback_hash = hash_map.get(item_path) or hash_map.get(f"__NAME__{basename}", "")
@@ -546,7 +554,7 @@ def build_rearranged_structure_tree(
     Raises FileNotFoundError / ValueError on missing or malformed inputs;
     the orchestrator is responsible for surfacing the failure to the user.
     """
-    print("Building rearranged structure tree...")
+    log.info("Building rearranged structure tree...")
 
     plan_data = load_json_file(str(plan_path))
     enriched_data = load_json_file(str(enriched_data_path))
@@ -592,10 +600,10 @@ def build_rearranged_structure_tree(
                         }
                     )
     except Exception as e:
-        print(f"Warning: failed to append practice/support sections: {e}")
+        log.warning("Failed to append practice/support sections: %s", e, exc_info=True)
 
     _write_json(Path(output_path), result_tree, indent=2)
-    print(f"Rearranged structure tree saved to: {output_path}")
+    log.info("Rearranged structure tree saved to: %s", output_path)
 
 
 # =============================================================================
@@ -702,32 +710,32 @@ def _step_enrich(context: PipelineContext, base_dir: Path, args: argparse.Namesp
 
 
 def _step_backbone(context: PipelineContext, base_dir: Path, args: argparse.Namespace) -> None:
-    print("=" * 60)
-    print("Step 1: Backbone Identification")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("Step 1: Backbone Identification")
+    log.info("=" * 60)
     enriched_data = _load_enriched(base_dir, context.course_name)
     backbone_path = run_backbone_identification(enriched_data)
 
     backbone_output = Path(context.output_dir) / "backbone_result.json"
     _write_json(backbone_output, {"backbone_path": backbone_path})
-    print(f"Backbone result saved to: {backbone_output}")
+    log.info("Backbone result saved to: %s", backbone_output)
 
 
 def _step_match(context: PipelineContext, base_dir: Path, args: argparse.Namespace) -> None:
-    print("=" * 60)
-    print("Step 2: Orphan Matching")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("Step 2: Orphan Matching")
+    log.info("=" * 60)
     enriched_data = _load_enriched(base_dir, context.course_name)
 
     backbone_file = Path(context.output_dir) / "backbone_result.json"
     if backbone_file.exists():
         backbone_path = load_json_file(str(backbone_file))["backbone_path"]
     else:
-        print("No backbone result found, running backbone identification first...")
+        log.info("No backbone result found, running backbone identification first...")
         backbone_path = run_backbone_identification(enriched_data)
         # Persist so re-runs of `match` don't re-pay the LLM call.
         _write_json(backbone_file, {"backbone_path": backbone_path})
-        print(f"Backbone result saved to: {backbone_file}")
+        log.info("Backbone result saved to: %s", backbone_file)
 
     matches, plan = run_plan_matching(
         enriched_data,
@@ -737,17 +745,17 @@ def _step_match(context: PipelineContext, base_dir: Path, args: argparse.Namespa
 
     matches_output = Path(context.output_dir) / "orphan_matches.json"
     _write_json(matches_output, matches.model_dump())
-    print(f"Orphan matches saved to: {matches_output}")
+    log.info("Orphan matches saved to: %s", matches_output)
 
     plan_output = Path(context.output_dir) / "rearrangement_plan.json"
     _write_json(plan_output, plan)
-    print(f"Rearrangement plan saved to: {plan_output}")
+    log.info("Rearrangement plan saved to: %s", plan_output)
 
 
 def _step_tree(context: PipelineContext, base_dir: Path, args: argparse.Namespace) -> None:
-    print("=" * 60)
-    print("Step 3: Tree Materialization")
-    print("=" * 60)
+    log.info("=" * 60)
+    log.info("Step 3: Tree Materialization")
+    log.info("=" * 60)
     output_dir = Path(context.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -787,10 +795,10 @@ def _step_tree(context: PipelineContext, base_dir: Path, args: argparse.Namespac
         else:
             cached = output_dir / "v4_tree_reorganized.json"
             if cached.exists():
-                print(f"Loading cached reorganized tree from: {cached}")
+                log.info("Loading cached reorganized tree from: %s", cached)
                 reorganized_tree = load_json_file(str(cached))
     except Exception as e:
-        print(f"Warning: failed to obtain reorganized tree for practice/support append: {e}")
+        log.warning("Failed to obtain reorganized tree for practice/support append: %s", e, exc_info=True)
 
     build_rearranged_structure_tree(
         plan_path,
@@ -822,9 +830,8 @@ def execute_pipeline_steps(
     for step_fn in _STEP_DISPATCH[args.step]:
         try:
             step_fn(context, base, args)
-        except Exception as e:
-            print(f"Error in step '{args.step}': {e}")
-            traceback.print_exc()
+        except Exception:
+            log.exception("Error in step '%s'", args.step)
             raise
 
 
@@ -839,9 +846,9 @@ def run_pipeline_cli(
     Path(context.output_dir).mkdir(parents=True, exist_ok=True)
     Path(context.log_dir).mkdir(parents=True, exist_ok=True)
 
-    print(f"Course:  {context.course_name}")
-    print(f"Outputs: {context.output_dir}")
-    print(f"Debug:   {context.log_dir}")
+    log.info("Course:  %s", context.course_name)
+    log.info("Outputs: %s", context.output_dir)
+    log.info("Debug:   %s", context.log_dir)
 
     token = set_pipeline_log_dir(context.log_dir)
     try:
@@ -869,6 +876,7 @@ def _run_pipeline(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    configure_cli_logging()
     args = parse_cli_args()
     base_dir = Path(__file__).resolve().parent
     context = _build_context(args, base_dir)

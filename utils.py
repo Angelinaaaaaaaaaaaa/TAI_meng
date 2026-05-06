@@ -8,6 +8,7 @@ Three concerns live here because none has any domain logic and all are tiny:
 
 import contextvars
 import json
+import logging
 import re
 import sys
 from collections import Counter
@@ -17,6 +18,44 @@ from typing import Any, Dict, Iterable, List, Optional
 from openai import OpenAI
 
 from models import MiscRefinementResponse
+
+log = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Logging configuration helper (called by CLI main)
+# =============================================================================
+
+class _LevelFormatter(logging.Formatter):
+    """Plain message for INFO/DEBUG; prefix WARNING/ERROR with the level name.
+
+    Preserves traceback/exception output (``log.exception`` and ``exc_info=True``).
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if record.levelno >= logging.WARNING:
+            msg = f"{record.levelname}: {msg}"
+        if record.exc_info:
+            msg = f"{msg}\n{self.formatException(record.exc_info)}"
+        if record.stack_info:
+            msg = f"{msg}\n{self.formatStack(record.stack_info)}"
+        return msg
+
+
+def configure_cli_logging(level: int = logging.INFO) -> None:
+    """Set up a single root StreamHandler with a clean format. Idempotent."""
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Drop any pre-existing handlers we previously installed (avoid duplicates
+    # when this is called more than once, e.g. from tests).
+    for h in list(root.handlers):
+        if getattr(h, "_rearrange_managed", False):
+            root.removeHandler(h)
+    handler = logging.StreamHandler()
+    handler.setFormatter(_LevelFormatter())
+    handler._rearrange_managed = True  # type: ignore[attr-defined]
+    root.addHandler(handler)
 
 
 # =============================================================================
@@ -52,8 +91,12 @@ def _console_safe(text: str) -> str:
 
 
 def _safe_print(message: str) -> None:
-    """Print without raising UnicodeEncodeError in restricted terminals."""
-    print(_console_safe(message))
+    """Emit a message at INFO level, sanitized for the active console encoding.
+
+    Kept as a thin compatibility wrapper around the logger so existing call sites
+    (which previously used this in lieu of a logger) keep working.
+    """
+    log.info(_console_safe(message))
 
 
 # =============================================================================
@@ -106,7 +149,7 @@ def save_debug_log(
     with file_path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-    print(f"[DEBUG] Saved {step_name} log to: {file_path}")
+    log.debug("Saved %s log to: %s", step_name, file_path)
     return str(file_path)
 
 

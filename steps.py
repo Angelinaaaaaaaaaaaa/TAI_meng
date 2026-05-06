@@ -8,6 +8,7 @@ Sections (in pipeline order):
 """
 
 import json
+import logging
 import re
 import sqlite3
 import warnings
@@ -33,6 +34,8 @@ from utils import (
     _safe_print,
     save_debug_log,
 )
+
+log = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -121,7 +124,7 @@ def build_tree_from_final_paths(final_paths_doc: Dict) -> Dict:
     msg = f"[build] Built tree with {placed} files from {len(entries)} team-1 entries"
     if duplicate_targets:
         msg += f" ({duplicate_targets} dropped as duplicate targets)"
-    print(msg + ".")
+    log.info("%s.", msg)
     return new_root
 
 
@@ -245,7 +248,7 @@ def reorganize_tree_by_final_paths(tree: Dict, final_paths_doc: Dict) -> Dict:
     )
     if duplicate_targets:
         msg += f"; {duplicate_targets} dropped as duplicate targets"
-    print(msg + ".")
+    log.info("%s.", msg)
     return new_root
 
 
@@ -476,14 +479,14 @@ def enrich_structure_with_descriptions(
     already in memory).
     """
     if input_data is None:
-        print(f"Reading input structure from: {input_json_path}")
+        log.info("Reading input structure from: %s", input_json_path)
         input_path = Path(input_json_path)
         if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
         with input_path.open("r", encoding="utf-8") as f:
             input_data = json.load(f)
     else:
-        print(f"Using pre-loaded input tree (origin: {input_json_path})")
+        log.info("Using pre-loaded input tree (origin: %s)", input_json_path)
 
     db = Path(db_path)
     if not db.exists():
@@ -587,13 +590,15 @@ def enrich_structure_with_descriptions(
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", encoding="utf-8") as f:
             json.dump(enriched_root, f, indent=2, ensure_ascii=False)
-        print(f"Enriched JSON structure saved to: {out}")
-        print(
-            f"Processed {stats.processed} files, enriched {stats.enriched} with descriptions"
+        log.info("Enriched JSON structure saved to: %s", out)
+        log.info(
+            "Processed %d files, enriched %d with descriptions",
+            stats.processed,
+            stats.enriched,
         )
         return output_path
 
-    print("Warning: No 'study' content found in input tree.")
+    log.warning("No 'study' content found in input tree.")
     return ""
 
 
@@ -770,7 +775,7 @@ def run_backbone_identification(
         response_model=BackboneResult,
         seed=DEFAULT_LLM_SEED,
     )
-    print(f"Identified backbone: {result.backbone_path}")
+    log.info("Identified backbone: %s", result.backbone_path)
     return result.backbone_path
 
 
@@ -1105,7 +1110,7 @@ def _filter_matches(
             filtered_matches.append(match)
             if cleaned_path not in fixed_paths:
                 fixed_paths.add(cleaned_path)
-                _safe_print(f"  - Fixed LLM path: '{cleaned_path}' -> '{match.item_path}'")
+                log.info("  - Fixed LLM path: %r -> %r", cleaned_path, match.item_path)
             continue
 
         # Basename rescue: LLM often drops/adds intermediate folders. Accept iff unique.
@@ -1117,18 +1122,21 @@ def _filter_matches(
             filtered_matches.append(match)
             if cleaned_path not in fixed_paths:
                 fixed_paths.add(cleaned_path)
-                _safe_print(f"  - Rescued by basename: '{cleaned_path}' -> '{resolved}'")
+                log.info("  - Rescued by basename: %r -> %r", cleaned_path, resolved)
             continue
 
         if cleaned_path in warned_paths:
             continue
         warned_paths.add(cleaned_path)
         if len(candidates) > 1:
-            _safe_print(
-                f"  - Warning: Ambiguous basename '{leaf}' matches {len(candidates)} orphans, dropping: {cleaned_path}"
+            log.warning(
+                "Ambiguous basename %r matches %d orphans, dropping: %s",
+                leaf,
+                len(candidates),
+                cleaned_path,
             )
         else:
-            _safe_print(f"  - Warning: Filtered out hallucinated item: {cleaned_path}")
+            log.warning("Filtered out hallucinated item: %s", cleaned_path)
 
     return filtered_matches
 
@@ -1254,7 +1262,7 @@ def _refine_misc_group(
         return
 
     misc_items = plan_map[misc_key]["related_items"]
-    print(f"Refining {len(misc_items)} items in the Lecture Miscellaneous folder...")
+    log.info("Refining %d items in the Lecture Miscellaneous folder...", len(misc_items))
 
     misc_payload = [
         {"item_path": path, "filename": path.split("/")[-1]} for path in misc_items
@@ -1263,7 +1271,7 @@ def _refine_misc_group(
     try:
         refined_result = gateway.refine_miscellaneous_groups(misc_payload, seed=seed)
     except Exception as e:
-        print(f"Failed to refine Miscellaneous folder: {e}")
+        log.error("Failed to refine Miscellaneous folder: %s", e, exc_info=True)
         return
 
     plan_map[misc_key]["related_items"] = []
@@ -1280,7 +1288,7 @@ def _refine_misc_group(
         if assignment.item_path not in plan_map[new_key]["related_items"]:
             plan_map[new_key]["related_items"].append(assignment.item_path)
 
-    print("Successfully refined the Miscellaneous folder into specific categories.")
+    log.info("Successfully refined the Miscellaneous folder into specific categories.")
 
 
 def _serialize_plan(plan_map: Dict[str, Dict]) -> List[Dict]:
@@ -1314,7 +1322,7 @@ def generate_rearrangement_plan(
     _refine_misc_group(plan_map, gateway)
 
     final_plan = _serialize_plan(plan_map)
-    print(f"Generated rearrangement plan with {len(final_plan)} groups.")
+    log.info("Generated rearrangement plan with %d groups.", len(final_plan))
     return final_plan
 
 
