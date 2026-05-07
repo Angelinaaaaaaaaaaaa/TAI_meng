@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-bfs_v4.py
+bfs_v5.py
 
-BFS-based File Reorganization Agent — v4.
-python bfs_v4.py \
-  --source "106B/EECS 106B" \
-  --db "106B/collective_metadata.db" \
-  --model "gpt-5-mini-2025-08-07" \
-  --execute \
-  --dest "106B/EECS 106B_out"
+BFS-based File Reorganization Agent — v5.
 
-Edits:
-  - No MAX_ANCESTOR_DEPTH or truncation for concatenated descriptions
-  - Study destination has NO "lecture/" injection:
-      study/<top_folder>/<tail>
-  - Default model remains: gpt-5-mini-2025-08-07
-  - File classification outputs are only: study/practice/support (handled in classify_v4.py).
+Changes from v4:
+  - Adds missing_from_db: full relative paths of files found on disk that have NO
+    entry in the metadata DB.
+  - Keeps all v4 behavior inline in this file (no import from bfs_v4).
+
+Example:
+  python bfs_v5.py \
+    --source "106B/EECS 106B" \
+    --db "106B/collective_metadata.db" \
+    --model "gpt-5-mini-2025-08-07" \
+    --execute \
+    --dest "106B/EECS 106B_out"
 """
 
 import json
@@ -57,16 +57,15 @@ HARD_SKIP_DIRS: Set[str] = {
 }
 
 DEFAULT_DB_PATH = "file.db"
-LLM_DEBUG_LOG_FILE = "bfs_v4_llm_debug.json"
-REPORT_MD_FILE = "bfs_v4_report.md"
-PLAN_JSON_FILE = "bfs_v4_plan.json"
-TREE_JSON_FILE = "bfs_v4_tree.json"
+LLM_DEBUG_LOG_FILE = "bfs_v5_llm_debug.json"
+REPORT_MD_FILE = "bfs_v5_report.md"
+PLAN_JSON_FILE = "bfs_v5_plan.json"
+TREE_JSON_FILE = "bfs_v5_tree.json"
+FINAL_PATHS_JSON_FILE = "bfs_v5_final_paths.json"
 MAX_SEQUENCE_CONTEXT_ITEMS = 80
 MAX_SEQUENCE_DESCRIPTION_CHARS = 240
 MAX_SEQUENCE_ITEM_DESCRIPTION_CHARS = 360
 
-
-### YK's Modification: add TASK_KEYWORDS and priorities according to task/seq classification rules in classify_v4.py to cover more edge cases that may be missed by the model, especially for files with sparse descriptions. This is a simple keyword-based heuristic that runs before the LLM classification, and can override the category to practice/study/support based on the presence of certain keywords in the file name or description.
 PRESET_TASK_NAMES: Set[str] = {
     "announcements",
     "administrative",
@@ -79,13 +78,14 @@ PRESET_TASK_NAMES: Set[str] = {
     "quiz",
     "resources",
 }
-TASK_KEYWORDS = set(PRESET_TASK_NAMES) # added known keywords for covering missing cases.
+TASK_KEYWORDS = set(PRESET_TASK_NAMES)
 TASK_NAME_ALIASES: Dict[str, Set[str]] = {
     "discussion": {"disc", "section", "worksheet"},
     "homework": {"hw"},
     "lecture": {"lec"},
     "project": {"proj"},
 }
+
 
 def normalize_task_name(raw: Optional[str]) -> Optional[str]:
     """Normalize task labels without applying a preset allow/deny list."""
@@ -205,7 +205,6 @@ def category_depth_for(
     return min(deepest, len(folder_parts))
 
 
-
 # ====================================================================
 #  Additional Data Structures (BFS-specific)
 # ====================================================================
@@ -229,7 +228,6 @@ class FileMapping:
     top_folder: str
     category: str
     reason: str
-    ## YK's Modification: add task_name and seq_name to the final classification result for more granular report generation
     task_name: Optional[str] = None
     sequence_name: Optional[str] = None
     category_depth: int = 0
@@ -244,13 +242,12 @@ class TraversalResult:
     mappings: Dict[str, FileMapping]    # keyed by source_rel
     files_classified_individually: int
     files_classified_via_folder: int
-    # Sync stats
     files_on_disk_count: int = 0
     files_missing_in_db: List[str] = field(default_factory=list)
     files_stale_in_db: List[str] = field(default_factory=list)
-    # Tree root (for tree JSON export)
     root_node: Optional[FolderNode] = None
-    
+    # v5 addition: full relative paths missing in DB
+    missing_from_db: List[str] = field(default_factory=list)
 
 
 # ====================================================================
@@ -581,6 +578,20 @@ def compute_sync_stats(
     return missing_in_db, stale_in_db
 
 
+def collect_missing_from_db(
+    files_on_disk: List[str],
+    file_index: Dict[str, FileIndexEntry],
+) -> List[str]:
+    """Return full relative paths of files on disk that have no DB entry by filename."""
+    db_filenames: Set[str] = set(file_index.keys())
+    missing: List[str] = []
+    for rel_path in files_on_disk:
+        fname = os.path.basename(rel_path)
+        if fname not in db_filenames:
+            missing.append(rel_path)
+    return sorted(missing)
+
+
 # ====================================================================
 #  BFS Traverser
 # ====================================================================
@@ -600,6 +611,7 @@ class BFSTraverser:
         self,
         source_path: str,
         max_depth: Optional[int] = None,
+        debug: bool = False,
     ) -> TraversalResult:
         """Main entry point: run the full BFS pipeline."""
         source_path = os.path.abspath(source_path)
@@ -613,6 +625,7 @@ class BFSTraverser:
         logger.info(f"[BFS] Found {len(files_on_disk)} files on disk")
 
         missing_in_db, stale_in_db = compute_sync_stats(file_index, files_on_disk)
+        missing_from_db = collect_missing_from_db(files_on_disk, file_index)
 
         root = build_tree(source_path, files_on_disk, file_index)
         logger.info(f"[BFS] Tree: {len(root.children)} top-level folders")
@@ -622,16 +635,19 @@ class BFSTraverser:
         result.files_on_disk_count = len(files_on_disk)
         result.files_missing_in_db = missing_in_db
         result.files_stale_in_db = stale_in_db
-        result.root_node = root  # Store for tree JSON export
+        result.root_node = root
+        result.missing_from_db = missing_from_db
 
         logger.info(
             f"[BFS] Done: {result.files_classified_via_folder} via folder, "
             f"{result.files_classified_individually} individually, "
             f"{len(result.skipped_folders)} skipped, "
-            f"{len(result.mappings)} mappings"
+            f"{len(result.mappings)} mappings, "
+            f"{len(result.missing_from_db)} missing_from_db"
         )
 
-        self.classifier.save_debug_log(LLM_DEBUG_LOG_FILE)
+        if debug:
+            self.classifier.save_debug_log(LLM_DEBUG_LOG_FILE)
         return result
 
     def _bfs_classify(
@@ -648,7 +664,6 @@ class BFSTraverser:
         seen: Set[str] = set()
         known_task_names: Set[str] = set(PRESET_TASK_NAMES)
         ancestor_desc_map: Dict[str, List[str]] = {}
-        # Maps folder_path -> (task_name, sequence_name) derived structurally
         task_context_map: Dict[str, tuple] = {}
         task_queue: deque[Union[FolderNode, FileMeta]] = deque()
 
@@ -748,14 +763,10 @@ class BFSTraverser:
             f"(mixed={result.is_mixed}, by_type={result.by_type}, by_sequence={result.by_sequence}, task_name={result.task_name}, sequence_name={result.sequence_name})"
         )
 
-        # Accumulate ancestor context (NO depth cap)
         child_ancestors = list(my_ancestors)
         if result.folder_description:
             child_ancestors.append(result.folder_description)
 
-        # --- Derive task context for child folders structurally ---
-        # by_type=True  → each child's name IS the task_name
-        # Sequence names are inferred after BFS; children otherwise inherit parent's task context.
         current_task_name = result.task_name or my_task_name
         current_seq_name = result.sequence_name or my_seq_name
 
@@ -767,7 +778,6 @@ class BFSTraverser:
                 return (child_task_name, None)
             return (current_task_name, current_seq_name)
 
-        # SKIP: always descend
         if result.category == Category.SKIP:
             skipped_folders.append(item.path)
             classifications[item.path] = Classification(
@@ -790,7 +800,6 @@ class BFSTraverser:
                 task_queue.append(f)
             return
 
-        # Mixed: treat like SKIP (descend, no DB write)
         if result.is_mixed:
             skipped_folders.append(item.path)
             classifications[item.path] = Classification(
@@ -813,9 +822,6 @@ class BFSTraverser:
                 task_queue.append(f)
             return
 
-        # Organizer folders should be descended into so child folders/files can get
-        # their own category. Otherwise containers like assets/ stamp all children
-        # as support even when they contain lec/, hw/, disc/, proj/, etc.
         if result.by_type:
             classifications[item.path] = Classification(
                 path=item.path,
@@ -861,7 +867,6 @@ class BFSTraverser:
                 task_queue.append(f)
             return
 
-        # Non-SKIP, non-mixed: assign folder directly
         classifications[item.path] = Classification(
             path=item.path,
             category=result.category,
@@ -872,7 +877,6 @@ class BFSTraverser:
 
         logger.info(f"[BFS]   -> Assigning {len(folder_files)} files directly")
 
-        # Write to DB only on confident non-SKIP assignment
         if result.folder_description:
             file_names = [f.file_name for f in folder_files]
             uuids = self.db.get_uuids_for_files(file_names)
@@ -890,9 +894,6 @@ class BFSTraverser:
             )
 
             top = top_level_folder(f.source_path)
-
-            # Direct folder assignment stamps all descendants with this folder's
-            # task/sequence context.
             file_task = task_name_from_source_context(
                 f.source_path,
                 result.category.value,
@@ -970,7 +971,6 @@ class BFSTraverser:
             f"[BFS] File '{item.source_path}': {result.category.value}"
         )
 
-        # classify_v4 guarantees file category is only study/practice/support
         classifications[item.source_path] = Classification(
             path=item.source_path,
             category=result.category,
@@ -980,7 +980,6 @@ class BFSTraverser:
         )
         top = top_level_folder(item.source_path)
 
-        # Inherit task/sequence context from folder (or file-specific entry set during skip/mixed)
         file_task, file_seq = task_context_map.get(
             item.source_path,
             task_context_map.get(item.folder_path, (None, None))
@@ -1032,6 +1031,7 @@ def _build_class_tree(
     classifications: Dict[str, Classification],
     folder_decisions: Dict[str, ClassificationResult],
 ) -> dict:
+    """Build the v3-style BFS classification tree over the SOURCE hierarchy."""
     node_dict: dict = {
         "path": node.path,
         "name": node.name,
@@ -1045,6 +1045,9 @@ def _build_class_tree(
         node_dict["folder_description"] = fd.folder_description
         node_dict["by_type"] = fd.by_type
         node_dict["by_sequence"] = fd.by_sequence
+        node_dict["task_name"] = fd.task_name
+        node_dict["sequence_name"] = fd.sequence_name
+        node_dict["category_depth"] = fd.category_depth
 
     files_dict: dict = {}
     for f in node.files:
@@ -1072,24 +1075,86 @@ def _build_class_tree(
     return node_dict
 
 
+def _build_result_tree(result: TraversalResult) -> dict:
+    """Build a tree over FINAL destination paths after all post-processing.
+
+    This is the tree users usually expect when they inspect the reorganized result,
+    because it reflects task/sequence insertion and final-path flattening.
+    """
+    root: dict = {
+        "path": ".",
+        "name": "result_root",
+        "type": "folder",
+        "children": {},
+    }
+
+    for mapping in sorted(result.mappings.values(), key=lambda m: (m.dest_rel, m.source_rel)):
+        parts = [p for p in mapping.dest_rel.replace("\\", "/").split("/") if p]
+        if not parts:
+            continue
+
+        cur = root
+        acc: List[str] = []
+        for part in parts[:-1]:
+            acc.append(part)
+            children = cur.setdefault("children", {})
+            if part not in children:
+                children[part] = {
+                    "path": "/".join(acc),
+                    "name": part,
+                    "type": "folder",
+                    "children": {},
+                }
+            cur = children[part]
+
+        files = cur.setdefault("files", {})
+        files[mapping.source_rel] = {
+            "path": mapping.dest_rel,
+            "name": os.path.basename(mapping.dest_rel),
+            "type": "file",
+            "source_path": mapping.source_rel,
+            "final_path": mapping.dest_rel,
+            "category": mapping.category,
+            "task_name": mapping.task_name,
+            "sequence_name": mapping.sequence_name,
+            "category_depth": mapping.category_depth,
+        }
+
+    return root
+
+
 def export_tree_json(
     result: TraversalResult,
     out_path: str = TREE_JSON_FILE,
 ) -> None:
+    """Export BOTH the source-side BFS tree and the final result tree.
+
+    Why both:
+      - bfs_tree preserves the v3 behavior and is useful for debugging traversal
+        and folder/file classification decisions on the original repository.
+      - result_tree reflects the actual reorganized output after task/sequence
+        inference and final-path flattening.
+    """
     if result.root_node is None:
         logger.warning("[TREE] root_node is None — skipping tree JSON export")
         return
 
-    tree = _build_class_tree(
+    bfs_tree = _build_class_tree(
         result.root_node,
         result.classifications,
         result.folder_decisions,
     )
+    result_tree = _build_result_tree(result)
+
+    payload = {
+        "bfs_tree": bfs_tree,
+        "result_tree": result_tree,
+    }
 
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(tree, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    print(f"Exported classification tree to {out_path}")
+    print(f"Exported classification/result tree to {out_path}")
 
 
 # ====================================================================
@@ -1141,7 +1206,7 @@ def execute_moves(
 #  Task/Sequence Name Pipeline
 # ====================================================================
 
-def collect_task_names(mappings: Dict[str, "FileMapping"]) -> Set[str]:
+def collect_task_names(mappings: Dict[str, FileMapping]) -> Set[str]:
     """Collect the known task-name set from mappings with an identified task."""
     names: Set[str] = set(PRESET_TASK_NAMES)
     for m in mappings.values():
@@ -1160,7 +1225,7 @@ def collect_task_names(mappings: Dict[str, "FileMapping"]) -> Set[str]:
 
 
 def rematch_missing_task_names(
-    mappings: Dict[str, "FileMapping"],
+    mappings: Dict[str, FileMapping],
     known_task_names: Set[str],
     classifier: LLMClassifier,
     classifications: Dict[str, Classification],
@@ -1217,26 +1282,14 @@ def _extract_sequence_from_filename(
 ) -> Optional[str]:
     """
     Extract a sequence identifier from a filename.
-
-    Tries (in order):
-      1. Numeric components  : "02_disc.pdf"          → "02"
-                                "2_23.pdf"            → "2_23"
-                                "118_disc.pdf"        → "118"
-      2. Numeric suffix      : "boardwork_1_26.pdf"  → "1_26"
-      3. Word_Number prefix  : "Discussion_10_CBF.pdf" → "Discussion_10"
-      4. Prefix+number stem  : "hw02.pdf", "week03.pdf" → "hw02", "week03"
-
-    Returns None if no recognisable sequence pattern is found.
     """
     stem = os.path.splitext(filename)[0]
-    # Split on underscore, hyphen, or space
     parts = re.split(r'[_\-\s]+', stem)
     if not parts:
         return None
 
     first = parts[0]
 
-    # 1. Numeric prefix, preserving numeric components as written.
     if re.fullmatch(r'\d+', first):
         text_prefix = _filename_text_prefix_after_numeric(parts, task_name)
         numeric_parts = []
@@ -1248,18 +1301,13 @@ def _extract_sequence_from_filename(
         digit_seq = "_".join(numeric_parts)
         return f"{text_prefix}_{digit_seq}" if text_prefix else digit_seq
 
-    # 2. Numeric suffix pair (e.g. "boardwork_1_26" -> "1_26")
     if len(parts) >= 3 and re.fullmatch(r'\d{1,2}', parts[-2]) and re.fullmatch(r'\d{1,2}', parts[-1]):
         return f"{parts[-2]}_{parts[-1]}"
 
-    # 3. Word_Number prefix  (e.g. "Discussion" + "10")
     if len(parts) >= 2 and re.fullmatch(r'\d+', parts[1]):
         candidate = f"{first}_{parts[1]}"
-        # Don't return something that is just the task_name + number
-        # if the word is a vague task abbreviation we want the full form
         return candidate
 
-    # 4. Alphabetic prefix + number in one token (e.g. "hw02", "week03")
     if re.fullmatch(r'[A-Za-z]+\d+[A-Za-z]?', first):
         return first.lower()
 
@@ -1294,16 +1342,13 @@ def _extract_sequence_from_path_components(
 ) -> Optional[str]:
     """
     Derive a sequence name from folder components in the path.
-
-    Only uses the component that follows the task_name folder.
-    No blind fallback to the parent folder name.
     """
     parts = source_rel.replace("\\", "/").split("/")
     if len(parts) < 2 or not task_name:
         return None
 
     lower_task = task_name.lower()
-    for i, p in enumerate(parts[:-1]):          # exclude filename
+    for i, p in enumerate(parts[:-1]):
         if p.lower() == lower_task and i + 1 < len(parts) - 1:
             candidate = parts[i + 1]
             cl = candidate.lower()
@@ -1315,13 +1360,10 @@ def _extract_sequence_from_path_components(
 
 def _extract_sequence_from_db(
     filename: str,
-    file_index: Dict[str, "FileIndexEntry"],
+    file_index: Dict[str, FileIndexEntry],
 ) -> Optional[str]:
     """
-    Scan the DB description / extra_info for sequence markers
-    such as "Week 5", "Discussion 10", "Lecture 7", "HW #2".
-
-    Returns a normalised lowercase sequence string, or None.
+    Scan the DB description / extra_info for sequence markers.
     """
     entry = file_index.get(filename)
     if not entry:
@@ -1375,25 +1417,15 @@ def is_supported_sequence_name(seq: Optional[str]) -> bool:
 
 
 def fill_sequence_names(
-    mappings: Dict[str, "FileMapping"],
-    file_index: Optional[Dict[str, "FileIndexEntry"]] = None,
+    mappings: Dict[str, FileMapping],
+    file_index: Optional[Dict[str, FileIndexEntry]] = None,
     classifier: Optional[LLMClassifier] = None,
     classifications: Optional[Dict[str, Classification]] = None,
     folder_decisions: Optional[Dict[str, ClassificationResult]] = None,
     batch_size: int = 25,
 ) -> None:
     """
-    For each mapping with task_name known and sequence_name missing, attempt to
-    fill sequence_name using batch context first, then local fallbacks:
-
-      1. Ask the LLM to infer sequence names across batches of files with the same category/task,
-         with context from all other files and folders in that task group.
-      2. Extract from the filename  (e.g. "Discussion_10_CBF.pdf" → "Discussion_10")
-      3. Extract from path folder components after the task_name folder
-      4. Extract from the DB description / extra_info (if file_index is provided)
-
-    Files for which no sequence can be identified keep sequence_name blank
-    (their final path will be category/task_name/filename with no seq subfolder).
+    Fill sequence_name using LLM batch context first, then local fallbacks.
     """
     all_mappings = list(mappings.values())
     pending = [
@@ -1515,15 +1547,11 @@ def fill_sequence_names(
             continue
 
         filename = os.path.basename(m.source_rel)
-
-        # Strategy 1: filename-encoded sequence
         seq = _extract_sequence_from_filename(filename, m.task_name)
 
-        # Strategy 2: path-component sequence
         if not seq:
             seq = _extract_sequence_from_path_components(m.source_rel, m.task_name)
 
-        # Strategy 3: DB description / extra_info
         if not seq and file_index:
             seq = _extract_sequence_from_db(filename, file_index)
         if seq and not is_supported_sequence_name(seq):
@@ -1568,7 +1596,7 @@ def fill_sequence_names(
 
 
 def _apply_folder_sequences_to_mappings(
-    mappings: List["FileMapping"],
+    mappings: List[FileMapping],
     folder_decisions: Optional[Dict[str, ClassificationResult]],
 ) -> int:
     """Copy a sequence inferred for a folder onto same-task files inside it."""
@@ -1622,7 +1650,7 @@ def _apply_folder_sequences_to_mappings(
 
 
 def canonicalize_sequence_names_by_task(
-    mappings: List["FileMapping"],
+    mappings: List[FileMapping],
     folder_decisions: Optional[Dict[str, ClassificationResult]] = None,
 ) -> int:
     """Make equivalent same-task sequence labels use the richest shared spelling."""
@@ -1718,8 +1746,8 @@ def _choose_canonical_sequence_label(labels) -> Optional[str]:
 def _sequence_task_group_context(
     category: str,
     task_name: str,
-    mappings: List["FileMapping"],
-    file_index: Optional[Dict[str, "FileIndexEntry"]] = None,
+    mappings: List[FileMapping],
+    file_index: Optional[Dict[str, FileIndexEntry]] = None,
     classifications: Optional[Dict[str, Classification]] = None,
     folder_decisions: Optional[Dict[str, ClassificationResult]] = None,
 ) -> List[Dict[str, str]]:
@@ -1804,8 +1832,8 @@ def _limited_sequence_task_context(
 
 
 def _sequence_batch_payload(
-    mapping: "FileMapping",
-    file_index: Optional[Dict[str, "FileIndexEntry"]] = None,
+    mapping: FileMapping,
+    file_index: Optional[Dict[str, FileIndexEntry]] = None,
     classifications: Optional[Dict[str, Classification]] = None,
 ) -> Dict[str, str]:
     """Build one compact item for batch sequence-name inference."""
@@ -1862,7 +1890,6 @@ def _sequence_folder_batch_payload(
 def _derive_sequence_from_path(source_rel: str, task_name: Optional[str]) -> Optional[str]:
     """
     Legacy wrapper — delegates to the new helpers.
-    Kept for backward compatibility with any external callers.
     """
     filename = os.path.basename(source_rel)
     return (
@@ -1871,11 +1898,10 @@ def _derive_sequence_from_path(source_rel: str, task_name: Optional[str]) -> Opt
     )
 
 
-def build_final_path(m: "FileMapping") -> str:
+def build_final_path(m: FileMapping) -> str:
     """
     Build the structured final destination path:
       {category}/{task_name}/{sequence_name}/{source suffix deeper than category_depth}
-    Falls back gracefully when task_name, sequence_name, or deeper suffix is absent.
     """
     return build_dest_rel(
         m.category,
@@ -1889,10 +1915,6 @@ def build_final_path(m: "FileMapping") -> str:
 def flatten_single_file_folders(paths_by_source: Dict[str, str]) -> Dict[str, str]:
     """
     Re-check final paths and flatten one-file folders until stable.
-
-    If a destination folder directly contains exactly one file, that file is moved
-    to the folder's parent. Collisions are left unchanged. The top-level category
-    folder is preserved.
     """
     flattened = dict(paths_by_source)
     max_passes = max(
@@ -1954,7 +1976,7 @@ def flatten_single_file_folders(paths_by_source: Dict[str, str]) -> Dict[str, st
     return flattened
 
 
-def apply_flattened_final_paths(mappings: Dict[str, "FileMapping"]) -> None:
+def apply_flattened_final_paths(mappings: Dict[str, FileMapping]) -> None:
     """Build final paths, flatten one-file folders, and store them in mappings."""
     final_paths = {
         source: build_final_path(mapping)
@@ -1972,11 +1994,8 @@ def apply_flattened_final_paths(mappings: Dict[str, "FileMapping"]) -> None:
     logger.info("[FLATTEN] Updated %d destination paths", changed)
 
 
-FINAL_PATHS_JSON_FILE = "bfs_v4_final_paths.json"
-
-
 def export_final_paths_json(
-    result: "TraversalResult",
+    result: TraversalResult,
     known_task_names: Set[str],
     out_path: str = FINAL_PATHS_JSON_FILE,
 ) -> None:
@@ -2082,7 +2101,7 @@ def generate_report(
 ) -> None:
     lines: List[str] = []
 
-    lines.append("# BFS v4 — Reorganization Report\n")
+    lines.append("# BFS v5 — Reorganization Report\n")
     lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     lines.append("## 1. Summary\n")
@@ -2099,7 +2118,8 @@ def generate_report(
     lines.append(f"| Files classified individually | {result.files_classified_individually} |")
     lines.append(f"| Total file mappings | {len(result.mappings)} |")
     lines.append(f"| Skipped folders (still descended) | {len(result.skipped_folders)} |")
-    lines.append(f"| Files not in DB | {len(result.files_missing_in_db)} |")
+    lines.append(f"| Files not in DB (filenames) | {len(result.files_missing_in_db)} |")
+    lines.append(f"| Files missing_from_db (full paths) | {len(result.missing_from_db)} |")
     lines.append(f"| Stale DB entries (no file) | {len(result.files_stale_in_db)} |")
     lines.append(f"| LLM calls | {len(classifier.debug_log)} |")
     lines.append("")
@@ -2132,7 +2152,7 @@ def generate_report(
         lines.append("")
 
     if result.files_missing_in_db:
-        lines.append("## 5. Files Not Found in DB\n")
+        lines.append("## 5. Files Not Found in DB (by filename)\n")
         lines.append(f"{len(result.files_missing_in_db)} files on disk have no matching DB entry ")
         lines.append("(classified without descriptions):\n")
         shown = result.files_missing_in_db[:30]
@@ -2142,8 +2162,18 @@ def generate_report(
             lines.append(f"- ... and {len(result.files_missing_in_db) - 30} more")
         lines.append("")
 
+    if result.missing_from_db:
+        lines.append("## 6. Missing From DB (full relative paths)\n")
+        lines.append(f"{len(result.missing_from_db)} files on disk have no metadata DB entry by filename.\n")
+        shown = result.missing_from_db[:50]
+        for path in shown:
+            lines.append(f"- `{path}`")
+        if len(result.missing_from_db) > 50:
+            lines.append(f"- ... and {len(result.missing_from_db) - 50} more")
+        lines.append("")
+
     if result.files_stale_in_db:
-        lines.append("## 6. Stale DB Entries\n")
+        lines.append("## 7. Stale DB Entries\n")
         lines.append(f"{len(result.files_stale_in_db)} DB entries have no corresponding file on disk:\n")
         shown = result.files_stale_in_db[:30]
         for fn in shown:
@@ -2183,6 +2213,7 @@ def export_mappings_json(result: TraversalResult, out_path: str = PLAN_JSON_FILE
             "total_mappings": len(result.mappings),
             "skipped_folders": len(result.skipped_folders),
             "files_missing_in_db": len(result.files_missing_in_db),
+            "missing_from_db": len(result.missing_from_db),
             "files_stale_in_db": len(result.files_stale_in_db),
         },
         "folder_decisions": {
@@ -2212,13 +2243,14 @@ def export_mappings_json(result: TraversalResult, out_path: str = PLAN_JSON_FILE
         ],
         "skipped_folders": result.skipped_folders,
         "files_missing_in_db": result.files_missing_in_db,
+        "missing_from_db": result.missing_from_db,
     }
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"Exported plan to {out_path}")
 
 
-def bfs_reorganize(
+def bfs_reorganize_v5(
     course_root: str,
     db_path: str = DEFAULT_DB_PATH,
     model: str = "gpt-5-mini-2025-08-07",
@@ -2227,6 +2259,7 @@ def bfs_reorganize(
     tree_path: str = TREE_JSON_FILE,
     final_paths_path: str = FINAL_PATHS_JSON_FILE,
     dest_dir: Optional[str] = None,
+    debug: bool = False,
 ) -> TraversalResult:
     db = CourseDB(db_path)
     db.connect()
@@ -2234,15 +2267,13 @@ def bfs_reorganize(
     try:
         classifier = LLMClassifier(model=model)
         traverser = BFSTraverser(db, classifier)
-        result = traverser.traverse(course_root)
+        result = traverser.traverse(course_root, debug=debug)
 
-        # --- Post-BFS task/sequence name pipeline ---
         known_task_names = collect_task_names(result.mappings)
         rematch_missing_task_names(
             result.mappings, known_task_names, classifier, result.classifications
         )
 
-        # Infer sequence names from batches of files with the same task.
         file_index = db.load_file_index()
         fill_sequence_names(
             result.mappings,
@@ -2253,11 +2284,12 @@ def bfs_reorganize(
         )
         apply_flattened_final_paths(result.mappings)
 
-        # --- Exports ---
-        generate_report(result, classifier, report_path)
-        export_mappings_json(result, json_path)
-        export_tree_json(result, tree_path)
         export_final_paths_json(result, known_task_names, final_paths_path)
+
+        if debug:
+            generate_report(result, classifier, report_path)
+            export_mappings_json(result, json_path)
+            export_tree_json(result, tree_path)
 
         if dest_dir:
             execute_moves(result, course_root, dest_dir)
@@ -2267,9 +2299,12 @@ def bfs_reorganize(
     return result
 
 
+bfs_reorganize = bfs_reorganize_v5
+
+
 def print_classification_summary(result: TraversalResult) -> None:
     print("\n" + "=" * 70)
-    print("BFS v4 — CLASSIFICATION SUMMARY")
+    print("BFS v5 — CLASSIFICATION SUMMARY")
     print("=" * 70)
 
     cat_counts: Dict[str, int] = {}
@@ -2287,6 +2322,12 @@ def print_classification_summary(result: TraversalResult) -> None:
     print(f"\nSkipped Folders ({len(result.skipped_folders)}) — all descended:")
     for folder in result.skipped_folders:
         print(f"  - {folder}")
+
+    print(f"\nMissing From DB ({len(result.missing_from_db)}):")
+    for path in result.missing_from_db[:20]:
+        print(f"  - {path}")
+    if len(result.missing_from_db) > 20:
+        print(f"  ... and {len(result.missing_from_db) - 20} more")
 
     print(f"\nFile Mappings: {len(result.mappings)}")
     print("=" * 70)
@@ -2307,14 +2348,14 @@ def main():
     )
 
     parser = argparse.ArgumentParser(
-        description="BFS v4 — Course File Reorganization Agent",
+        description="BFS v5 — Course File Reorganization Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  # Classify only (no file copies):\n"
-            "  python bfs_v4.py --source \"./EECS 106B_meng\" --db ./file.db\n\n"
+            "  python bfs_v5.py --source \"./EECS 106B_meng\" --db ./file.db\n\n"
             "  # Classify + copy into a new folder (original untouched):\n"
-            "  python bfs_v4.py --source \"./EECS 106B_meng\" --db ./file.db "
+            "  python bfs_v5.py --source \"./EECS 106B_meng\" --db ./file.db "
             "--execute --dest ./106B_reorganized\n"
         ),
     )
@@ -2340,6 +2381,10 @@ def main():
         help="Destination directory for reorganized files (required when --execute is set)"
     )
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Write intermediate files (plan JSON, tree JSON, report MD, LLM debug log)"
+    )
 
     args = parser.parse_args()
 
@@ -2357,7 +2402,7 @@ def main():
         sys.exit(1)
 
     print("=" * 70)
-    print("BFS v4 — Course File Reorganization Agent")
+    print("BFS v5 — Course File Reorganization Agent")
     print("=" * 70)
     print(f"Source:    {source}")
     print(f"DB:        {args.db}")
@@ -2372,7 +2417,7 @@ def main():
         print("Execute:   NO (dry-run — use --execute --dest <dir> to copy files)")
     print("=" * 70)
 
-    result = bfs_reorganize(
+    result = bfs_reorganize_v5(
         course_root=source,
         db_path=args.db,
         model=args.model,
@@ -2381,6 +2426,7 @@ def main():
         tree_path=args.tree_out,
         final_paths_path=args.final_paths,
         dest_dir=args.dest if args.execute else None,
+        debug=args.debug,
     )
 
     print_classification_summary(result)
