@@ -114,6 +114,17 @@ def explicit_task_name_from_source(source_rel: str) -> Optional[str]:
     if preset_matches:
         return preset_matches[0]
 
+    # Match tokens like 'lab2', 'slides03', 'homework5' — preset name + trailing digits.
+    # re.split keeps alphanumeric together, so 'lab2' stays as one token and misses the
+    # exact-match check above. Catch these with a suffix-digit pattern here.
+    preset_digit_pattern = re.compile(
+        r"^(" + "|".join(re.escape(p) for p in sorted(PRESET_TASK_NAMES)) + r")\d+[a-z]?$"
+    )
+    for token in sorted(tokens):
+        m = preset_digit_pattern.fullmatch(token)
+        if m:
+            return m.group(1)
+
     for task_name, aliases in TASK_NAME_ALIASES.items():
         if task_name not in PRESET_TASK_NAMES:
             continue
@@ -611,9 +622,16 @@ class BFSTraverser:
         self,
         source_path: str,
         max_depth: Optional[int] = None,
-        debug: bool = False,
     ) -> TraversalResult:
-        """Main entry point: run the full BFS pipeline."""
+        """Main entry point: run the full BFS pipeline.
+
+        v5 policy:
+          - files present on disk but missing from the metadata DB are RECORDED
+            in result.missing_from_db
+          - they are NOT added to the tree
+          - they are NOT classified
+          - they do NOT appear in mappings/final paths/output tree/copied result
+        """
         source_path = os.path.abspath(source_path)
         if not os.path.isdir(source_path):
             raise ValueError(f"Source directory not found: {source_path}")
@@ -627,7 +645,21 @@ class BFSTraverser:
         missing_in_db, stale_in_db = compute_sync_stats(file_index, files_on_disk)
         missing_from_db = collect_missing_from_db(files_on_disk, file_index)
 
-        root = build_tree(source_path, files_on_disk, file_index)
+        # IMPORTANT: only files with DB metadata are allowed to enter the BFS tree.
+        # Missing-from-DB files are recorded for reporting only.
+        processable_files: List[str] = []
+        db_filenames: Set[str] = set(file_index.keys())
+        for rel_path in files_on_disk:
+            if os.path.basename(rel_path) in db_filenames:
+                processable_files.append(rel_path)
+
+        logger.info(
+            "[BFS] %d files will be processed, %d files are missing from DB and will be excluded",
+            len(processable_files),
+            len(missing_from_db),
+        )
+
+        root = build_tree(source_path, processable_files, file_index)
         logger.info(f"[BFS] Tree: {len(root.children)} top-level folders")
 
         result = self._bfs_classify(root, file_index)
@@ -643,11 +675,10 @@ class BFSTraverser:
             f"{result.files_classified_individually} individually, "
             f"{len(result.skipped_folders)} skipped, "
             f"{len(result.mappings)} mappings, "
-            f"{len(result.missing_from_db)} missing_from_db"
+            f"{len(result.missing_from_db)} missing_from_db (excluded from processing)"
         )
 
-        if debug:
-            self.classifier.save_debug_log(LLM_DEBUG_LOG_FILE)
+        self.classifier.save_debug_log(LLM_DEBUG_LOG_FILE)
         return result
 
     def _bfs_classify(
@@ -2250,7 +2281,7 @@ def export_mappings_json(result: TraversalResult, out_path: str = PLAN_JSON_FILE
     print(f"Exported plan to {out_path}")
 
 
-def bfs_reorganize_v5(
+def bfs_reorganize(
     course_root: str,
     db_path: str = DEFAULT_DB_PATH,
     model: str = "gpt-5-mini-2025-08-07",
@@ -2259,7 +2290,6 @@ def bfs_reorganize_v5(
     tree_path: str = TREE_JSON_FILE,
     final_paths_path: str = FINAL_PATHS_JSON_FILE,
     dest_dir: Optional[str] = None,
-    debug: bool = False,
 ) -> TraversalResult:
     db = CourseDB(db_path)
     db.connect()
@@ -2267,7 +2297,7 @@ def bfs_reorganize_v5(
     try:
         classifier = LLMClassifier(model=model)
         traverser = BFSTraverser(db, classifier)
-        result = traverser.traverse(course_root, debug=debug)
+        result = traverser.traverse(course_root)
 
         known_task_names = collect_task_names(result.mappings)
         rematch_missing_task_names(
@@ -2284,12 +2314,11 @@ def bfs_reorganize_v5(
         )
         apply_flattened_final_paths(result.mappings)
 
+        # Export tree first so it is always written even if a later export crashes.
+        export_tree_json(result, tree_path)
+        generate_report(result, classifier, report_path)
+        export_mappings_json(result, json_path)
         export_final_paths_json(result, known_task_names, final_paths_path)
-
-        if debug:
-            generate_report(result, classifier, report_path)
-            export_mappings_json(result, json_path)
-            export_tree_json(result, tree_path)
 
         if dest_dir:
             execute_moves(result, course_root, dest_dir)
@@ -2297,9 +2326,6 @@ def bfs_reorganize_v5(
         db.close()
 
     return result
-
-
-bfs_reorganize = bfs_reorganize_v5
 
 
 def print_classification_summary(result: TraversalResult) -> None:
@@ -2381,10 +2407,6 @@ def main():
         help="Destination directory for reorganized files (required when --execute is set)"
     )
     parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument(
-        "--debug", action="store_true",
-        help="Write intermediate files (plan JSON, tree JSON, report MD, LLM debug log)"
-    )
 
     args = parser.parse_args()
 
@@ -2417,7 +2439,7 @@ def main():
         print("Execute:   NO (dry-run — use --execute --dest <dir> to copy files)")
     print("=" * 70)
 
-    result = bfs_reorganize_v5(
+    result = bfs_reorganize(
         course_root=source,
         db_path=args.db,
         model=args.model,
@@ -2426,7 +2448,6 @@ def main():
         tree_path=args.tree_out,
         final_paths_path=args.final_paths,
         dest_dir=args.dest if args.execute else None,
-        debug=args.debug,
     )
 
     print_classification_summary(result)
