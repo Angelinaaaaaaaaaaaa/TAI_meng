@@ -10,20 +10,30 @@ Sections:
   3. Tree builder (materialize plan to hierarchical JSON with file hashes)
   4. Step dispatch + ``run_pipeline_cli`` (called by file_rearrang.main)
 
-Layout per run:
+Storage policy:
+    Steps chain data in memory through ``PipelineState``. The ONLY file always
+    written is the final ``rearrangement_structure_tree.json``. With
+    ``--debug``, intermediates (study_enriched, backbone_result, orphan_matches,
+    rearrangement_plan, v4_tree_reorganized, debug/ checkpoints) also persist
+    for inspection. Without ``--debug``, nothing else hits disk — no periodic
+    cleanup needed.
+
+Layout per run (debug=True only, except final tree which always exists):
     outputs/<course>[/multi]/
-        study_enriched.json                  (enrich)
-        backbone_result.json                 (backbone)
-        orphan_matches.json                  (match)
-        rearrangement_plan.json              (match)
-        rearrangement_structure_tree.json    (tree — final artifact)
-        debug/                               (numbered checkpoints, observability only)
+        study_enriched.json                  (enrich, debug-only)
+        backbone_result.json                 (backbone, debug-only)
+        orphan_matches.json                  (match, debug-only)
+        rearrangement_plan.json              (match, debug-only)
+        v4_tree_reorganized.json             (enrich, debug-only)
+        rearrangement_structure_tree.json    (tree — final artifact, ALWAYS)
+        debug/                               (checkpoints, debug-only)
 """
 
 import argparse
 import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -70,6 +80,16 @@ PathLike = Union[str, Path]
 # 1. Context + path resolution
 # =============================================================================
 
+@dataclass
+class PipelineState:
+    """In-memory handoff between steps. Avoids the disk write/re-read cycle."""
+    enriched_data: Optional[Dict] = None
+    backbone_path: Optional[str] = None
+    matches: Optional[OrphanMatchResponse] = None
+    plan: Optional[List[Dict]] = None
+    reorganized_tree: Optional[Dict[str, Any]] = None
+
+
 def _build_context(args, base_dir: PathLike) -> PipelineContext:
     base = Path(base_dir)
     course_name = args.course or _derive_course_name(args.db, args.input)
@@ -85,6 +105,7 @@ def _build_context(args, base_dir: PathLike) -> PipelineContext:
         output_dir=str(output_dir),
         log_dir=str(log_dir),
         multi_match=bool(getattr(args, "multi_match", False)),
+        debug=bool(getattr(args, "debug", False)),
     )
 
 
@@ -145,7 +166,9 @@ def run_enrichment(
     course_name: Optional[str] = None,
     multi_match: bool = False,
     final_paths_filename: Optional[str] = None,
-) -> str:
+    *,
+    debug: bool = False,
+) -> Tuple[Dict, Optional[Dict]]:
     """Preprocessing: parse input tree JSON + SQLite DB → enriched JSON.
 
     Three ways to source the input tree:
@@ -172,8 +195,10 @@ def run_enrichment(
         course_name = _derive_course_name(db_filename, input_filename)
 
     output_dir = base / "outputs" / course_name
-    output_dir.mkdir(parents=True, exist_ok=True)
-    enriched_output = output_dir / "study_enriched.json"
+    enriched_output: Optional[Path] = None
+    if debug:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        enriched_output = output_dir / "study_enriched.json"
 
     log.info("=" * 60)
     log.info("Preprocessing: Enriching structure for course '%s'", course_name)
@@ -209,9 +234,10 @@ def run_enrichment(
             pre_built = build_tree_from_final_paths(final_paths_doc)
             input_file_for_log = final_paths_file
 
-        out = output_dir / "v4_tree_reorganized.json"
-        _write_json(out, pre_built, indent=2)
-        log.info("Reorganized tree saved to: %s", out)
+        if debug:
+            out = output_dir / "v4_tree_reorganized.json"
+            _write_json(out, pre_built, indent=2)
+            log.info("Reorganized tree saved to: %s", out)
     else:
         if not input_filename:
             raise ValueError(
@@ -220,13 +246,16 @@ def run_enrichment(
         input_file_for_log = _resolve_input_path(base, input_filename)
         log.info("Input file path: %s", input_file_for_log)
 
-    return enrich_structure_with_descriptions(
+    enriched = enrich_structure_with_descriptions(
         str(input_file_for_log) if input_file_for_log else "",
         str(db_file),
-        str(enriched_output),
+        str(enriched_output) if enriched_output else None,
         multi_match=multi_match,
         input_data=pre_built,
     )
+    if enriched is None:
+        raise ValueError("Enrichment produced no 'study' content from the input tree.")
+    return enriched, pre_built
 
 
 def _raw_tree_folder_to_structure_node(
@@ -547,21 +576,22 @@ def _build_group_node(
 
 
 def build_rearranged_structure_tree(
-    plan_path: PathLike,
-    enriched_data_path: PathLike,
+    plan: Union[PathLike, Dict, List],
+    enriched: Union[PathLike, Dict],
     db_path: PathLike,
     output_path: PathLike,
     reorganized_tree: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Build a full hierarchical tree based on the rearrangement plan.
 
-    Raises FileNotFoundError / ValueError on missing or malformed inputs;
-    the orchestrator is responsible for surfacing the failure to the user.
+    ``plan`` and ``enriched`` may be in-memory objects (preferred) or paths
+    to JSON files. Raises FileNotFoundError / ValueError on missing or
+    malformed inputs; the orchestrator surfaces the failure to the user.
     """
     log.info("Building rearranged structure tree...")
 
-    plan_data = load_json_file(str(plan_path))
-    enriched_data = load_json_file(str(enriched_data_path))
+    plan_data = plan if isinstance(plan, (dict, list)) else load_json_file(str(plan))
+    enriched_data = enriched if isinstance(enriched, dict) else load_json_file(str(enriched))
     hash_map = load_file_hashes(db_path)
 
     enriched_index = index_enriched_data(enriched_data)
@@ -569,7 +599,7 @@ def build_rearranged_structure_tree(
     plan_groups = _load_plan_groups(plan_data)
     if not plan_groups:
         raise ValueError(
-            f"Invalid plan format at {plan_path}: expected a list or {{'groups': [...]}}."
+            f"Invalid plan format: expected a list or {{'groups': [...]}}, got {type(plan_data).__name__}."
         )
 
     study_children = [_build_group_node(g, enriched_index, hash_map) for g in plan_groups]
@@ -614,117 +644,173 @@ def build_rearranged_structure_tree(
 # 4. Step dispatch + run_pipeline_cli
 # =============================================================================
 
-def _step_enrich(context: PipelineContext, base_dir: Path, args: argparse.Namespace) -> None:
+def _maybe_write_json(path: Path, data: Any, *, debug: bool, indent: int = 4) -> None:
+    """Write JSON only when running in debug mode."""
+    if not debug:
+        return
+    _write_json(path, data, indent=indent)
+
+
+def _ensure_enriched(state: PipelineState, context: PipelineContext, base_dir: Path) -> Dict:
+    if state.enriched_data is not None:
+        return state.enriched_data
+    # Disk fallback for individual-step CLI runs (debug artifact from a prior run).
+    enriched_path = Path(base_dir) / "outputs" / context.course_name / "study_enriched.json"
+    if not enriched_path.exists():
+        raise FileNotFoundError(
+            f"Enriched tree not in memory and not found at {enriched_path}. "
+            "Run the 'enrich' step (use --debug for persistent intermediates)."
+        )
+    state.enriched_data = load_json_file(str(enriched_path))
+    return state.enriched_data
+
+
+def _step_enrich(
+    state: PipelineState,
+    context: PipelineContext,
+    base_dir: Path,
+    args: argparse.Namespace,
+) -> None:
     final_paths = getattr(args, "final_paths", None)
     if not args.input and not final_paths:
         raise ValueError(
             "Provide either --input (first-pass tree) or --final-paths "
             "(team-1 second-pass doc) for the 'enrich' / 'all' steps."
         )
-    run_enrichment(
+    enriched, reorganized = run_enrichment(
         base_dir,
         args.input,
         args.db,
         context.course_name,
         multi_match=context.multi_match,
         final_paths_filename=final_paths,
+        debug=context.debug,
     )
+    state.enriched_data = enriched
+    state.reorganized_tree = reorganized
 
 
-def _step_backbone(context: PipelineContext, base_dir: Path, args: argparse.Namespace) -> None:
+def _step_backbone(
+    state: PipelineState,
+    context: PipelineContext,
+    base_dir: Path,
+    args: argparse.Namespace,
+) -> None:
     log.info("=" * 60)
     log.info("Step 1: Backbone Identification")
     log.info("=" * 60)
-    enriched_data = _load_enriched(base_dir, context.course_name)
+    enriched_data = _ensure_enriched(state, context, base_dir)
     backbone_path = run_backbone_identification(enriched_data)
+    state.backbone_path = backbone_path
 
-    backbone_output = Path(context.output_dir) / "backbone_result.json"
-    _write_json(backbone_output, {"backbone_path": backbone_path})
-    log.info("Backbone result saved to: %s", backbone_output)
+    _maybe_write_json(
+        Path(context.output_dir) / "backbone_result.json",
+        {"backbone_path": backbone_path},
+        debug=context.debug,
+    )
 
 
-def _step_match(context: PipelineContext, base_dir: Path, args: argparse.Namespace) -> None:
+def _step_match(
+    state: PipelineState,
+    context: PipelineContext,
+    base_dir: Path,
+    args: argparse.Namespace,
+) -> None:
     log.info("=" * 60)
     log.info("Step 2: Orphan Matching")
     log.info("=" * 60)
-    enriched_data = _load_enriched(base_dir, context.course_name)
+    enriched_data = _ensure_enriched(state, context, base_dir)
 
-    backbone_file = Path(context.output_dir) / "backbone_result.json"
-    if backbone_file.exists():
-        backbone_path = load_json_file(str(backbone_file))["backbone_path"]
-    else:
-        log.info("No backbone result found, running backbone identification first...")
-        backbone_path = run_backbone_identification(enriched_data)
-        # Persist so re-runs of `match` don't re-pay the LLM call.
-        _write_json(backbone_file, {"backbone_path": backbone_path})
-        log.info("Backbone result saved to: %s", backbone_file)
+    backbone_path = state.backbone_path
+    if backbone_path is None:
+        backbone_file = Path(context.output_dir) / "backbone_result.json"
+        if backbone_file.exists():
+            backbone_path = load_json_file(str(backbone_file))["backbone_path"]
+        else:
+            log.info("No backbone result available, running backbone identification first...")
+            backbone_path = run_backbone_identification(enriched_data)
+            _maybe_write_json(
+                backbone_file, {"backbone_path": backbone_path}, debug=context.debug
+            )
+        state.backbone_path = backbone_path
 
     matches, plan = run_plan_matching(
         enriched_data,
         backbone_path,
         multi_match=context.multi_match,
     )
+    state.matches = matches
+    state.plan = plan
 
-    matches_output = Path(context.output_dir) / "orphan_matches.json"
-    _write_json(matches_output, matches.model_dump())
-    log.info("Orphan matches saved to: %s", matches_output)
+    _maybe_write_json(
+        Path(context.output_dir) / "orphan_matches.json",
+        matches.model_dump(),
+        debug=context.debug,
+    )
+    _maybe_write_json(
+        Path(context.output_dir) / "rearrangement_plan.json",
+        plan,
+        debug=context.debug,
+    )
 
-    plan_output = Path(context.output_dir) / "rearrangement_plan.json"
-    _write_json(plan_output, plan)
-    log.info("Rearrangement plan saved to: %s", plan_output)
 
-
-def _step_tree(context: PipelineContext, base_dir: Path, args: argparse.Namespace) -> None:
+def _step_tree(
+    state: PipelineState,
+    context: PipelineContext,
+    base_dir: Path,
+    args: argparse.Namespace,
+) -> None:
     log.info("=" * 60)
     log.info("Step 3: Tree Materialization")
     log.info("=" * 60)
     output_dir = Path(context.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    plan_path = output_dir / "rearrangement_plan.json"
-    if not plan_path.exists():
-        raise FileNotFoundError(
-            f"Rearrangement plan not found at {plan_path}. Run the 'match' step first."
-        )
-    enriched_path = Path(base_dir) / "outputs" / context.course_name / "study_enriched.json"
-    if not enriched_path.exists():
-        raise FileNotFoundError(
-            f"Enriched tree not found at {enriched_path}. Run the 'enrich' step first."
-        )
+    enriched_data = _ensure_enriched(state, context, base_dir)
+
+    # Plan: prefer in-memory; fall back to disk artifact (debug-mode reruns).
+    plan_data: Any = state.plan
+    if plan_data is None:
+        plan_path = output_dir / "rearrangement_plan.json"
+        if not plan_path.exists():
+            raise FileNotFoundError(
+                f"Rearrangement plan not in memory and not found at {plan_path}. "
+                "Run the 'match' step first (use --debug for persistent intermediates)."
+            )
+        plan_data = load_json_file(str(plan_path))
 
     db_path = _resolve_db_path(base_dir, args.db)
     output_tree_path = output_dir / "rearrangement_structure_tree.json"
 
-    # Source the reorganized full-course tree (used to append practice/support
-    # top-level groups). Resolution order:
-    #   1. Re-build from original inputs when --final-paths is supplied (and
-    #      --input, for the reorganize path that preserves first-pass metadata).
-    #   2. Fall back to the persisted v4_tree_reorganized.json artifact written
-    #      by `enrich`. This is the *only* downstream step that reads back from
-    #      outputs/, and it does so as a cache — never as a pipeline input.
-    reorganized_tree: Optional[Dict[str, Any]] = None
-    try:
-        final_paths = getattr(args, "final_paths", None)
-        if final_paths:
-            final_paths_file = _resolve_input_path(base_dir, final_paths)
-            final_paths_doc = load_json_file(final_paths_file)
-            if args.input:
-                tree_file = _resolve_input_path(base_dir, args.input)
-                raw_tree = load_json_file(tree_file)
-                reorganized_tree = reorganize_tree_by_final_paths(raw_tree, final_paths_doc)
+    # Reorganized full-course tree (used to append practice/support sections).
+    # Resolution order:
+    #   1. In-memory from the enrich step (preferred — no disk I/O).
+    #   2. Re-build from original inputs when --final-paths is supplied.
+    #   3. Cached v4_tree_reorganized.json (debug-mode artifact).
+    reorganized_tree: Optional[Dict[str, Any]] = state.reorganized_tree
+    if reorganized_tree is None:
+        try:
+            final_paths = getattr(args, "final_paths", None)
+            if final_paths:
+                final_paths_file = _resolve_input_path(base_dir, final_paths)
+                final_paths_doc = load_json_file(final_paths_file)
+                if args.input:
+                    tree_file = _resolve_input_path(base_dir, args.input)
+                    raw_tree = load_json_file(tree_file)
+                    reorganized_tree = reorganize_tree_by_final_paths(raw_tree, final_paths_doc)
+                else:
+                    reorganized_tree = build_tree_from_final_paths(final_paths_doc)
             else:
-                reorganized_tree = build_tree_from_final_paths(final_paths_doc)
-        else:
-            cached = output_dir / "v4_tree_reorganized.json"
-            if cached.exists():
-                log.info("Loading cached reorganized tree from: %s", cached)
-                reorganized_tree = load_json_file(str(cached))
-    except Exception as e:
-        log.warning("Failed to obtain reorganized tree for practice/support append: %s", e, exc_info=True)
+                cached = output_dir / "v4_tree_reorganized.json"
+                if cached.exists():
+                    log.info("Loading cached reorganized tree from: %s", cached)
+                    reorganized_tree = load_json_file(str(cached))
+        except Exception as e:
+            log.warning("Failed to obtain reorganized tree for practice/support append: %s", e, exc_info=True)
 
     build_rearranged_structure_tree(
-        plan_path,
-        enriched_path,
+        plan_data,
+        enriched_data,
         db_path,
         output_tree_path,
         reorganized_tree=reorganized_tree,
@@ -741,17 +827,22 @@ _STEP_DISPATCH = {
 
 
 def execute_pipeline_steps(
-    context: PipelineContext, base_dir: PathLike, args: argparse.Namespace
+    context: PipelineContext,
+    base_dir: PathLike,
+    args: argparse.Namespace,
+    state: Optional[PipelineState] = None,
 ) -> None:
     """Run the requested step(s) according to ``args.step``.
 
-    Any step exception is logged and re-raised so the caller can fail fast
-    (and so ``--step all`` doesn't silently continue against stale artifacts).
+    Steps share a ``PipelineState`` so intermediate data flows in memory
+    instead of through the filesystem. Any step exception is logged and
+    re-raised so the caller can fail fast.
     """
     base = Path(base_dir)
+    state = state or PipelineState()
     for step_fn in _STEP_DISPATCH[args.step]:
         try:
-            step_fn(context, base, args)
+            step_fn(state, context, base, args)
         except Exception:
             log.exception("Error in step '%s'", args.step)
             raise
@@ -762,21 +853,29 @@ def run_pipeline_cli(
     base_dir: Optional[PathLike] = None,
     context: Optional[PipelineContext] = None,
 ) -> None:
-    """CLI entry: ensures dirs, binds debug-log context, runs the dispatched steps."""
+    """CLI entry: ensures dirs, binds debug-log context, runs the dispatched steps.
+
+    Output directory is always created (final tree is written there).
+    Debug log dir is created and bound only when ``context.debug=True``;
+    otherwise ``save_debug_log`` calls are no-ops.
+    """
     base = Path(base_dir) if base_dir else Path.cwd()
     context = context or _build_context(args, base)
     Path(context.output_dir).mkdir(parents=True, exist_ok=True)
-    Path(context.log_dir).mkdir(parents=True, exist_ok=True)
 
     log.info("Course:  %s", context.course_name)
     log.info("Outputs: %s", context.output_dir)
-    log.info("Debug:   %s", context.log_dir)
 
-    token = set_pipeline_log_dir(context.log_dir)
-    try:
+    if context.debug:
+        Path(context.log_dir).mkdir(parents=True, exist_ok=True)
+        log.info("Debug:   %s", context.log_dir)
+        token = set_pipeline_log_dir(context.log_dir)
+        try:
+            execute_pipeline_steps(context, base, args)
+        finally:
+            reset_pipeline_log_dir(token)
+    else:
         execute_pipeline_steps(context, base, args)
-    finally:
-        reset_pipeline_log_dir(token)
 
 
 def run_tree_step(
@@ -789,7 +888,7 @@ def run_tree_step(
     Assumes the caller has already entered an enclosing ``run_pipeline_cli`` /
     ``set_pipeline_log_dir`` context.
     """
-    _step_tree(context, Path(base_dir), args)
+    _step_tree(PipelineState(), context, Path(base_dir), args)
 
 
 def _run_pipeline(args: argparse.Namespace) -> None:

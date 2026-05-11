@@ -464,11 +464,11 @@ def _enrich_process_children(
 def enrich_structure_with_descriptions(
     input_json_path: str,
     db_path: str,
-    output_path: str,
+    output_path: Optional[str] = None,
     multi_match: bool = False,
     *,
     input_data: Optional[Dict] = None,
-) -> str:
+) -> Optional[Dict]:
     """Parse the input tree JSON, filter for 'study' category, fetch descriptions
     from database, and generate a standardized list-based JSON tree.
 
@@ -587,20 +587,21 @@ def enrich_structure_with_descriptions(
         if multi_match:
             _enrich_merge_practice_into_study(enriched_root)
 
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with out.open("w", encoding="utf-8") as f:
-            json.dump(enriched_root, f, indent=2, ensure_ascii=False)
-        log.info("Enriched JSON structure saved to: %s", out)
+        if output_path:
+            out = Path(output_path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with out.open("w", encoding="utf-8") as f:
+                json.dump(enriched_root, f, indent=2, ensure_ascii=False)
+            log.info("Enriched JSON structure saved to: %s", out)
         log.info(
             "Processed %d files, enriched %d with descriptions",
             stats.processed,
             stats.enriched,
         )
-        return output_path
+        return enriched_root
 
     log.warning("No 'study' content found in input tree.")
-    return ""
+    return None
 
 
 def extract_file_descriptions(enriched_data: Dict) -> List[FileDescription]:
