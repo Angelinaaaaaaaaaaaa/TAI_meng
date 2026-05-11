@@ -1,9 +1,10 @@
 """End-to-end pipeline orchestrator (v2).
 
-Connects the three project stages:
-  Stage 1 (BFS v5):   bfs_v5.bfs_reorganize_v5()    → final_paths.json  +  TraversalResult in memory
-  Stage 2 (Rearrange): rearrange pipeline             → rearrangement_structure_tree.json
-  Stage 3 (Eval):     evaluation (optional)           → evaluation_report.json
+Connects the project stages:
+  Stage 1   (BFS v5):    bfs_v5.bfs_reorganize_v5()  → final_paths.json + TraversalResult
+  Stage 2   (Rearrange): rearrange pipeline           → rearrangement_structure_tree.json
+  Stage 2.5 (Map to DB): map_to_db_v3 (tree-json)     → reorganized DB + logical output tree
+  Stage 3   (Eval):      evaluation (optional)        → evaluation_report.json
 
 Key design decisions (v2 changes vs v1):
   • RunMode.EVAL_ONLY  — run evaluation without BFS or Rearrange.
@@ -94,6 +95,12 @@ class OrchestratorConfig:
     eval_limit: int = 3
     eval_output_dir: Optional[str] = None
 
+    # Map-to-DB stage (Stage 2.5)
+    map_enabled: bool = True
+    map_output_table: str = "file_new"
+    map_logical_root: Optional[str] = None
+    map_db_output: Optional[str] = None
+
     # v2 additions
     debug: bool = False
 
@@ -133,12 +140,21 @@ class BfsStageResult:
 
 
 @dataclass
+class MapStageResult:
+    """Returned by run_map_stage; describes the materialized DB + logical tree."""
+    output_db_path: str
+    output_logical_root: str
+    output_table: str
+
+
+@dataclass
 class PipelineResult:
     """Returned by orchestrate(); never raises."""
     success: bool
     final_tree_path: Optional[str] = None
     bfs_paths: Optional[Dict[str, str]] = None
     bfs_stage_result: Optional[BfsStageResult] = None
+    map_stage_result: Optional[MapStageResult] = None
     eval_report: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
@@ -207,6 +223,36 @@ def bfs_reorganize_v5(*args, **kwargs):
 def run_pipeline_cli(*args, **kwargs):
     from rearrange.src.pipeline import run_pipeline_cli as _fn
     return _fn(*args, **kwargs)
+
+
+def _map_to_db_module():
+    import map_to_db_v3
+    return map_to_db_v3
+
+
+_COURSE_ALIASES = {
+    "cs61a": "cs61a", "61a": "cs61a", "cs_61a": "cs61a",
+    "eecs106b": "eecs106b", "106b": "eecs106b", "eecs_106b": "eecs106b",
+}
+
+
+def _resolve_map_course(raw: Optional[str], db_path: str) -> str:
+    """Normalize a user-supplied course string to map_to_db_v3's accepted form."""
+    candidates = []
+    if raw:
+        candidates.append(raw)
+    candidates.append(Path(db_path).stem)
+
+    for cand in candidates:
+        key = cand.lower().replace("-", "_").replace(" ", "_")
+        for alias, canonical in _COURSE_ALIASES.items():
+            if alias in key:
+                return canonical
+
+    raise ValueError(
+        f"Cannot determine map-to-db course from {raw!r}/{db_path!r}. "
+        "Pass --map-course cs61a or eecs106b."
+    )
 
 
 def run_evaluation(*args, **kwargs):
@@ -387,6 +433,67 @@ def run_rearrange_stage(
 
 
 # ---------------------------------------------------------------------------
+# Stage 2.5: Map to DB
+# ---------------------------------------------------------------------------
+
+def run_map_stage(
+    cfg: OrchestratorConfig,
+    *,
+    tree_json_path: str,
+) -> MapStageResult:
+    """Materialize the rearrangement tree into a reorganized DB + logical folder.
+
+    Consumes ``rearrangement_structure_tree.json`` (file nodes with
+    ``source``/``final_path``) via map_to_db_v3's tree-json mode.
+
+    Outputs are real deliverables (not intermediates), so they are written
+    regardless of cfg.debug.
+    """
+    output_dir = Path(cfg.output_dir)
+    course = _resolve_map_course(cfg.course_name, cfg.db_path)
+
+    map_root = Path(cfg.map_logical_root) if cfg.map_logical_root \
+        else output_dir / course / "logical"
+    map_db = Path(cfg.map_db_output) if cfg.map_db_output \
+        else output_dir / course / f"{course}_reorganized.db"
+
+    map_db.parent.mkdir(parents=True, exist_ok=True)
+    map_root.parent.mkdir(parents=True, exist_ok=True)
+
+    log.info("=" * 60)
+    log.info("Stage 2.5: Map to DB  (course=%s, table=%s)", course, cfg.map_output_table)
+    log.info("=" * 60)
+
+    mod = _map_to_db_module()
+    runner = mod.build_runner(
+        course=course,
+        output_table=cfg.map_output_table,
+        create_logical_output=False,
+        create_folder_symlinks=True,
+    )
+    # The course module's hardcoded DB_PATH is its own per-course default; point
+    # it at this run's metadata DB so map_to_db copies the right base.
+    runner.module.DB_PATH = str(Path(cfg.db_path).resolve())
+
+    with _resolved_path(cfg.source_dir) as resolved_source:
+        mod.run_tree_json_mode(
+            module=runner.module,
+            tree_json=tree_json_path,
+            source_root=resolved_source,
+            output_root=str(map_root),
+            output_db=str(map_db),
+            output_table=cfg.map_output_table,
+        )
+
+    log.info("Map-to-DB complete. db → %s | tree → %s", map_db, map_root)
+    return MapStageResult(
+        output_db_path=str(map_db),
+        output_logical_root=str(map_root),
+        output_table=cfg.map_output_table,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stage 3: Evaluation
 # ---------------------------------------------------------------------------
 
@@ -438,6 +545,7 @@ def orchestrate(cfg: OrchestratorConfig) -> PipelineResult:
     """Run all enabled pipeline stages in order.  Never raises."""
     bfs_result: Optional[BfsStageResult] = None
     final_tree_path: Optional[str] = None
+    map_result: Optional[MapStageResult] = None
     eval_report: Optional[Dict[str, Any]] = None
 
     try:
@@ -454,6 +562,11 @@ def orchestrate(cfg: OrchestratorConfig) -> PipelineResult:
                 final_paths_path=cfg.bfs_final_paths if bfs_result is None else None,
                 bfs_stage_result=bfs_result,
             )
+
+        # ---- Stage 2.5: Map to DB ----------------------------------------
+        if cfg.map_enabled and final_tree_path:
+            log.info("Starting map-to-db stage")
+            map_result = run_map_stage(cfg, tree_json_path=final_tree_path)
 
         # ---- Stage 3: Evaluation -----------------------------------------
         if cfg.run_mode == RunMode.EVAL_ONLY:
@@ -494,6 +607,7 @@ def orchestrate(cfg: OrchestratorConfig) -> PipelineResult:
         final_tree_path=final_tree_path,
         bfs_paths=bfs_paths,
         bfs_stage_result=bfs_result,
+        map_stage_result=map_result,
         eval_report=eval_report,
     )
 
@@ -551,6 +665,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         metavar="{true,false}",
         help="Allow orphan files to match multiple backbone groups (default: true)",
     )
+    p.add_argument(
+        "--map",
+        dest="map_enabled",
+        type=lambda v: v.lower() not in ("false", "0", "no"),
+        default=True,
+        metavar="{true,false}",
+        help="Run Stage 2.5 map-to-db (default: true)",
+    )
+    p.add_argument("--map-output-table", default="file_new", help="Map-to-db output table name")
+    p.add_argument("--map-logical-root", default=None, help="Map-to-db logical output folder")
+    p.add_argument("--map-db-output", default=None, help="Map-to-db output metadata DB path")
     p.add_argument("--eval", action="store_true", dest="eval_enabled", help="Run evaluation stage")
     p.add_argument(
         "--ground-truth",
@@ -605,6 +730,10 @@ def main(argv=None) -> None:
             eval_method=args.eval_method,
             eval_limit=args.eval_limit,
             eval_output_dir=args.eval_output_dir,
+            map_enabled=args.map_enabled,
+            map_output_table=args.map_output_table,
+            map_logical_root=args.map_logical_root,
+            map_db_output=args.map_db_output,
             debug=args.debug,
         )
     except ValueError as exc:
@@ -624,6 +753,9 @@ def main(argv=None) -> None:
             print(f"  Missing from DB : {len(result.missing_from_db)} file(s)")
         if result.final_tree_path:
             print(f"  Structure tree  : {result.final_tree_path}")
+        if result.map_stage_result:
+            print(f"  Reorganized DB  : {result.map_stage_result.output_db_path}")
+            print(f"  Logical output  : {result.map_stage_result.output_logical_root}")
         if result.eval_report:
             f1 = result.eval_report.get("f1")
             if f1 is not None:
