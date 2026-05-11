@@ -25,23 +25,6 @@ Our capstone addresses this infrastructure problem by reorganizing course reposi
 
 ---
 
-## Repository overview
-
-Current top-level files in the repository include:
-
-- `bfs_v5.py` — Step 1 traversal and categorization pipeline
-- `classify_v4.py` — Step 1 LLM classifier and task/sequence extraction logic
-- `pipeline_orchestrator.py` — end-to-end orchestration across BFS, rearrangement, DB mapping, and evaluation
-- `rearrange/src/pipeline.py` — Step 2 orchestration and CLI implementation
-- `rearrange/src/core/steps.py` — Step 2 backbone detection, orphan collection, matching, and plan generation
-- `rearrange/src/services/models.py` — shared schemas and pipeline context models
-- `rearrange/src/utils/utils.py` — logging, JSON helpers, path utilities, OpenAI gateway
-- `map_to_db_v3.py` — downstream DB mapping orchestrator
-- `rearrange/file_rearrang.py` — compatibility re-export shim for the Step 2 pipeline
-- `bfs_v4.py`, `bfs_v3.py`, `classify_v3.py` — earlier Step 1 versions kept for reference
-- `second_pass_organizer.py` and files under `unused/` — auxiliary or legacy files
-
----
 
 # End-to-end system architecture
 
