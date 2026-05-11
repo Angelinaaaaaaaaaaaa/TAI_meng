@@ -49,3 +49,4 @@ class PipelineContext:
     output_dir: str
     log_dir: str
     multi_match: bool
+    debug: bool = False

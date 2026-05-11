@@ -45,6 +45,7 @@ Programmatic usage:
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -274,7 +275,14 @@ def run_bfs_stage(cfg: OrchestratorConfig) -> BfsStageResult:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    final_paths_out = str(output_dir / "bfs_v5_final_paths.json")
+    if cfg.debug:
+        final_paths_out = str(output_dir / "bfs_v5_final_paths.json")
+    else:
+        # Non-debug: write to a tempfile that the orchestrator cleans up after
+        # the run. Avoids stranded JSON in outputs/ that needs periodic cleanup.
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="bfs_v5_final_paths_", suffix=".json")
+        os.close(tmp_fd)
+        final_paths_out = tmp_path
     tree_out = str(output_dir / "bfs_v5_tree.json") if cfg.debug else None
     report_out = str(output_dir / "bfs_v5_report.md") if cfg.debug else None
     json_out = str(output_dir / "bfs_v5_plan.json") if cfg.debug else None
@@ -408,15 +416,17 @@ def run_evaluation_stage(
             limit=cfg.eval_limit,
         )
 
-    eval_out_dir = Path(cfg.eval_output_dir or Path(cfg.output_dir) / "eval_reports")
-    eval_out_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.debug:
+        eval_out_dir = Path(cfg.eval_output_dir or Path(cfg.output_dir) / "eval_reports")
+        eval_out_dir.mkdir(parents=True, exist_ok=True)
 
-    pred_stem = Path(prediction_path).stem
-    gt_stem = Path(cfg.ground_truth_path).name.replace(".zip", "")
-    report_file = eval_out_dir / f"{gt_stem}_{pred_stem}_{cfg.eval_method}_limit_{cfg.eval_limit}.json"
-    report_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-    log.info("Evaluation complete. report → %s", report_file)
+        pred_stem = Path(prediction_path).stem
+        gt_stem = Path(cfg.ground_truth_path).name.replace(".zip", "")
+        report_file = eval_out_dir / f"{gt_stem}_{pred_stem}_{cfg.eval_method}_limit_{cfg.eval_limit}.json"
+        report_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        log.info("Evaluation complete. report → %s", report_file)
+    else:
+        log.info("Evaluation complete. (report kept in memory; pass --debug to persist)")
     return report
 
 
@@ -459,6 +469,18 @@ def orchestrate(cfg: OrchestratorConfig) -> PipelineResult:
     except Exception as exc:
         log.exception("Pipeline failed: %s", exc)
         return PipelineResult(success=False, error=str(exc))
+    finally:
+        # When debug=False we wrote BFS final_paths to a tempfile (see
+        # run_bfs_stage). Clean it up now that downstream stages are done.
+        if (
+            not cfg.debug
+            and bfs_result is not None
+            and bfs_result.final_paths_json_path
+        ):
+            try:
+                Path(bfs_result.final_paths_json_path).unlink(missing_ok=True)
+            except OSError as e:
+                log.warning("Could not remove temp final_paths file: %s", e)
 
     # Build backward-compat bfs_paths dict for callers that used the old API.
     bfs_paths: Optional[Dict[str, str]] = None

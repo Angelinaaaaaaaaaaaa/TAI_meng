@@ -119,15 +119,14 @@ def save_debug_log(
 ) -> str:
     """Save an intermediate checkpoint to ``<log_dir>/<step_name>.json``.
 
-    Resolution order: explicit ``log_dir`` > ContextVar binding > ``<base_dir>/logs``.
+    No-op when no log_dir is bound (i.e., debug mode is off).
+    Resolution order: explicit ``log_dir`` > ContextVar binding. When neither
+    is set we skip writing entirely so production runs leave no files behind.
     """
     effective_log = log_dir or _PIPELINE_LOG_DIR.get()
-    if effective_log:
-        resolved_log_dir = Path(effective_log)
-    else:
-        base = Path(base_dir) if base_dir else Path.cwd()
-        resolved_log_dir = base / "logs"
-
+    if not effective_log:
+        return ""
+    resolved_log_dir = Path(effective_log)
     resolved_log_dir.mkdir(parents=True, exist_ok=True)
     file_path = resolved_log_dir / f"{step_name}.json"
     with file_path.open("w", encoding="utf-8") as f:
