@@ -193,9 +193,14 @@ def category_depth_for(
     folder_parts = parts[:-1] if is_file else parts
 
     deepest = 0
+    solution_depth = _solution_wrapper_sequence_depth(folder_parts, sequence_name)
     targets = [v.lower() for v in (task_name, sequence_name) if v]
     for i, part in enumerate(folder_parts, 1):
-        if part.lower() in targets:
+        if part.lower() in targets or _path_part_mentions_task_or_sequence(
+            part,
+            task_name,
+            sequence_name,
+        ):
             deepest = max(deepest, i)
 
     if is_file and targets:
@@ -206,6 +211,8 @@ def category_depth_for(
                 normalized_target and normalized_target in normalized_stem
             ):
                 deepest = max(deepest, len(folder_parts))
+        if _filename_mentions_sequence(filename_stem, task_name, sequence_name):
+            deepest = max(deepest, len(folder_parts))
 
     if model_depth > 0:
         deepest = max(deepest, model_depth)
@@ -213,7 +220,114 @@ def category_depth_for(
     if targets and deepest == 0:
         deepest = len(folder_parts)
 
+    if solution_depth is not None:
+        deepest = solution_depth
+
     return min(deepest, len(folder_parts))
+
+
+def _solution_wrapper_sequence_depth(
+    folder_parts: List[str],
+    sequence_name: Optional[str],
+) -> Optional[int]:
+    """Anchor assignment sequence before sol-* folders so solution structure remains."""
+    if not sequence_name:
+        return None
+
+    seq_numbers = re.findall(r"\d+[a-z]?", sequence_name.lower())
+    if not seq_numbers:
+        return None
+
+    seq_marker = _canonical_sequence_marker(seq_numbers[-1])
+    for i, part in enumerate(folder_parts, 1):
+        normalized = re.sub(r"[^a-z0-9]+", "", part.lower())
+        if not normalized.startswith("sol"):
+            continue
+        part_numbers = re.findall(r"\d+[a-z]?", normalized)
+        if part_numbers and _canonical_sequence_marker(part_numbers[-1]) == seq_marker:
+            return max(i - 1, 0)
+
+    return None
+
+
+def _canonical_sequence_marker(marker: str) -> str:
+    """Normalize sequence markers so 1 and 01 compare equal."""
+    match = re.fullmatch(r"(\d+)([a-z]?)", marker.lower())
+    if not match:
+        return marker.lower()
+    number = str(int(match.group(1)))
+    return number + match.group(2)
+
+
+def _path_part_mentions_task_or_sequence(
+    part: str,
+    task_name: Optional[str],
+    sequence_name: Optional[str],
+) -> bool:
+    """Match folders like hw/hw03 against homework/Homework_3 metadata."""
+    normalized = re.sub(r"[^a-z0-9]+", "", part.lower())
+    if not normalized:
+        return False
+
+    task = normalize_task_name(task_name)
+    if task:
+        task_normalized = re.sub(r"[^a-z0-9]+", "", task)
+        if normalized == task_normalized:
+            return True
+        aliases = TASK_NAME_ALIASES.get(task, set())
+        if normalized in aliases:
+            return True
+    else:
+        aliases = set()
+
+    if not sequence_name:
+        return False
+
+    seq_numbers = re.findall(r"\d+[a-z]?", sequence_name.lower())
+    part_numbers = re.findall(r"\d+[a-z]?", normalized)
+    if not seq_numbers or not part_numbers:
+        return False
+    if _canonical_sequence_marker(seq_numbers[-1]) != _canonical_sequence_marker(part_numbers[-1]):
+        return False
+
+    if not task:
+        return True
+    if normalized.startswith(task):
+        return True
+    return any(normalized.startswith(alias) for alias in aliases)
+
+
+def _filename_mentions_sequence(
+    filename_stem: str,
+    task_name: Optional[str],
+    sequence_name: Optional[str],
+) -> bool:
+    """Return true when filename has the same sequence number as task sequence."""
+    if not sequence_name:
+        return False
+
+    seq_numbers = re.findall(r"\d+[a-z]?", sequence_name.lower())
+    file_numbers = re.findall(r"\d+[a-z]?", filename_stem.lower())
+    if not seq_numbers or not file_numbers:
+        return False
+    if _canonical_sequence_marker(seq_numbers[-1]) != _canonical_sequence_marker(file_numbers[-1]):
+        return False
+
+    task = normalize_task_name(task_name)
+    if not task:
+        return True
+
+    stem_tokens = {token for token in re.split(r"[^a-z0-9]+", filename_stem.lower()) if token}
+    if task in stem_tokens:
+        return True
+    aliases = TASK_NAME_ALIASES.get(task, set())
+    if aliases & stem_tokens:
+        return True
+
+    normalized_stem = re.sub(r"[^a-z0-9]+", "", filename_stem.lower())
+    return normalized_stem.startswith(task) or any(
+        normalized_stem.startswith(alias) for alias in aliases
+    )
 
 
 # ====================================================================
@@ -308,8 +422,8 @@ class CourseDB:
         conn = self._ensure_connected()
         cur = conn.cursor()
         cur.execute(
-            "SELECT uuid, file_name, description, relative_path, "
-            "extra_info, file_hash FROM file"
+            "SELECT uuid, file_name, description, "
+            "relative_path, extra_info, file_hash FROM file"
         )
         rows = cur.fetchall()
 
@@ -326,8 +440,7 @@ class CourseDB:
                 uuid=r["uuid"],
                 file_name=fname,
                 description=r["description"] or "",
-                original_path=r["relative_path"],
-                relative_path=r["relative_path"],
+                original_path=r["relative_path"] or "",
                 extra_info=r["extra_info"] or "",
                 file_hash=r["file_hash"] or None,
             )
@@ -622,6 +735,7 @@ class BFSTraverser:
         self,
         source_path: str,
         max_depth: Optional[int] = None,
+        debug: bool = False,
     ) -> TraversalResult:
         """Main entry point: run the full BFS pipeline.
 
@@ -678,7 +792,8 @@ class BFSTraverser:
             f"{len(result.missing_from_db)} missing_from_db (excluded from processing)"
         )
 
-        self.classifier.save_debug_log(LLM_DEBUG_LOG_FILE)
+        if debug:
+            self.classifier.save_debug_log(LLM_DEBUG_LOG_FILE)
         return result
 
     def _bfs_classify(
@@ -803,6 +918,13 @@ class BFSTraverser:
 
         def _child_task_ctx(child_name: str) -> tuple:
             if result.by_type:
+                child_task_name = current_task_name or explicit_task_name_from_source(child_name)
+                child_seq_name = _extract_sequence_from_filename(child_name, child_task_name)
+                if child_task_name and child_seq_name and is_supported_sequence_name(child_seq_name):
+                    if known_task_names is not None:
+                        known_task_names.add(child_task_name)
+                    return (child_task_name, child_seq_name)
+
                 child_task_name = normalize_task_name(child_name)
                 if child_task_name and known_task_names is not None:
                     known_task_names.add(child_task_name)
@@ -1339,9 +1461,46 @@ def _extract_sequence_from_filename(
         candidate = f"{first}_{parts[1]}"
         return candidate
 
-    if re.fullmatch(r'[A-Za-z]+\d+[A-Za-z]?', first):
-        return first.lower()
+    compact = re.fullmatch(r'([A-Za-z]+)(\d+[A-Za-z]?)', first)
+    if compact:
+        typed = _typed_sequence_from_compact_token(
+            compact.group(1),
+            compact.group(2),
+            task_name,
+        )
+        return typed or first.lower()
 
+    for part in parts[1:]:
+        compact = re.fullmatch(r'([A-Za-z]+)(\d+[A-Za-z]?)', part)
+        if not compact:
+            continue
+        typed = _typed_sequence_from_compact_token(
+            compact.group(1),
+            compact.group(2),
+            task_name,
+        )
+        if typed:
+            return typed
+
+    return None
+
+
+def _typed_sequence_from_compact_token(
+    prefix: str,
+    marker: str,
+    task_name: Optional[str],
+) -> Optional[str]:
+    """Expand compact task aliases like hw01 to homework_1 when task is known."""
+    task = normalize_task_name(task_name)
+    normalized_prefix = prefix.lower()
+    if not task:
+        return None
+
+    marker = _canonical_sequence_marker(marker)
+    if normalized_prefix == task:
+        return f"{task}_{marker}"
+    if normalized_prefix in TASK_NAME_ALIASES.get(task, set()):
+        return f"{task}_{marker}"
     return None
 
 
@@ -1459,6 +1618,13 @@ def fill_sequence_names(
     Fill sequence_name using LLM batch context first, then local fallbacks.
     """
     all_mappings = list(mappings.values())
+    explicit_overrides = _apply_explicit_sequence_overrides(all_mappings)
+    if explicit_overrides:
+        logger.info(
+            "[FILL_SEQ] Applied %d filename/path sequence overrides",
+            explicit_overrides,
+        )
+
     pending = [
         m for m in all_mappings
         if m.task_name and not m.sequence_name
@@ -1624,6 +1790,31 @@ def fill_sequence_names(
             sequenced_folders,
             task_only_folders,
         )
+
+
+def _apply_explicit_sequence_overrides(mappings: List[FileMapping]) -> int:
+    """Prefer explicit file/path sequence markers over inherited folder context."""
+    changed = 0
+    for m in mappings:
+        if not m.task_name:
+            continue
+
+        explicit_seq = _derive_sequence_from_path(m.source_rel, m.task_name)
+        if not explicit_seq or not is_supported_sequence_name(explicit_seq):
+            continue
+        if m.sequence_name == explicit_seq:
+            continue
+
+        m.sequence_name = explicit_seq
+        m.category_depth = category_depth_for(
+            m.source_rel,
+            m.task_name,
+            m.sequence_name,
+            m.category_depth,
+        )
+        changed += 1
+
+    return changed
 
 
 def _apply_folder_sequences_to_mappings(
@@ -1943,6 +2134,12 @@ def build_final_path(m: FileMapping) -> str:
     )
 
 
+def _preserve_single_file_folder(folder_name: str) -> bool:
+    """Keep meaningful wrapper folders even when they contain one file."""
+    normalized = re.sub(r"[^a-z0-9]+", "", folder_name.lower())
+    return normalized.startswith("sol")
+
+
 def flatten_single_file_folders(paths_by_source: Dict[str, str]) -> Dict[str, str]:
     """
     Re-check final paths and flatten one-file folders until stable.
@@ -1976,12 +2173,14 @@ def flatten_single_file_folders(paths_by_source: Dict[str, str]) -> Dict[str, st
             filename = os.path.basename(dest)
             parent_files = files_by_parent.get(parent, [])
             parent_child_folders = child_folders_by_parent.get(parent, set())
+            parent_name = os.path.basename(parent)
 
             if (
                 parent
                 and "/" in parent
                 and len(parent_files) == 1
                 and not parent_child_folders
+                and not _preserve_single_file_folder(parent_name)
             ):
                 grandparent = os.path.dirname(parent)
                 candidate = _join_rel(grandparent, filename)
@@ -2281,7 +2480,7 @@ def export_mappings_json(result: TraversalResult, out_path: str = PLAN_JSON_FILE
     print(f"Exported plan to {out_path}")
 
 
-def bfs_reorganize(
+def bfs_reorganize_v5(
     course_root: str,
     db_path: str = DEFAULT_DB_PATH,
     model: str = "gpt-5-mini-2025-08-07",
@@ -2290,6 +2489,7 @@ def bfs_reorganize(
     tree_path: str = TREE_JSON_FILE,
     final_paths_path: str = FINAL_PATHS_JSON_FILE,
     dest_dir: Optional[str] = None,
+    debug: bool = False,
 ) -> TraversalResult:
     db = CourseDB(db_path)
     db.connect()
@@ -2297,7 +2497,7 @@ def bfs_reorganize(
     try:
         classifier = LLMClassifier(model=model)
         traverser = BFSTraverser(db, classifier)
-        result = traverser.traverse(course_root)
+        result = traverser.traverse(course_root, debug=debug)
 
         known_task_names = collect_task_names(result.mappings)
         rematch_missing_task_names(
@@ -2314,11 +2514,12 @@ def bfs_reorganize(
         )
         apply_flattened_final_paths(result.mappings)
 
-        # Export tree first so it is always written even if a later export crashes.
-        export_tree_json(result, tree_path)
-        generate_report(result, classifier, report_path)
-        export_mappings_json(result, json_path)
         export_final_paths_json(result, known_task_names, final_paths_path)
+
+        if debug:
+            export_tree_json(result, tree_path)
+            generate_report(result, classifier, report_path)
+            export_mappings_json(result, json_path)
 
         if dest_dir:
             execute_moves(result, course_root, dest_dir)
@@ -2326,6 +2527,9 @@ def bfs_reorganize(
         db.close()
 
     return result
+
+
+bfs_reorganize = bfs_reorganize_v5
 
 
 def print_classification_summary(result: TraversalResult) -> None:
@@ -2407,6 +2611,10 @@ def main():
         help="Destination directory for reorganized files (required when --execute is set)"
     )
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Write intermediate files (plan JSON, tree JSON, report MD, LLM debug log)"
+    )
 
     args = parser.parse_args()
 
@@ -2439,7 +2647,7 @@ def main():
         print("Execute:   NO (dry-run — use --execute --dest <dir> to copy files)")
     print("=" * 70)
 
-    result = bfs_reorganize(
+    result = bfs_reorganize_v5(
         course_root=source,
         db_path=args.db,
         model=args.model,
@@ -2448,6 +2656,7 @@ def main():
         tree_path=args.tree_out,
         final_paths_path=args.final_paths,
         dest_dir=args.dest if args.execute else None,
+        debug=args.debug,
     )
 
     print_classification_summary(result)

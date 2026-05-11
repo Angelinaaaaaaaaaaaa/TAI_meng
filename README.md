@@ -288,6 +288,16 @@ python bfs_v5.py \
   --model "gpt-5-mini-2025-08-07"
 ```
 
+### Run Step 1 with debug inspection files
+
+```bash
+python bfs_v5.py \
+  --source "/path/to/course_repo" \
+  --db "/path/to/course_metadata.db" \
+  --model "gpt-5-mini-2025-08-07" \
+  --debug
+```
+
 ### Run Step 1 and copy reorganized files
 
 ```bash
@@ -299,9 +309,14 @@ python bfs_v5.py \
   --dest "/path/to/course_repo_out"
 ```
 
-### Useful outputs to inspect
+### Outputs
 
-- `bfs_v5_final_paths.json`
+Always produced:
+
+- `bfs_v5_final_paths.json` — flattened routing records for Step 2
+
+Produced only with `--debug`:
+
 - `bfs_v5_report.md`
 - `bfs_v5_plan.json`
 - `bfs_v5_tree.json`
@@ -559,7 +574,7 @@ According to the capstone report, the system was evaluated against manually cura
 - **End-to-end exact-match accuracy:** 81.7%
 - improved exact-path accuracy over the raw baseline while preserving high category and filename recovery
 
-The report also notes strong generalization behavior on additional courses such as **CS 106B** and **CS 288**.
+The report also notes strong generalization behavior on additional courses such as **EECS 106B** and **CS 288**.
 
 ---
 

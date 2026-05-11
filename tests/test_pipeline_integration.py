@@ -361,6 +361,7 @@ class TestRunEvaluationStage:
             eval_enabled=True,
             ground_truth_path=str(gt_dir),
             eval_output_dir=str(tmp_project / "eval_reports"),
+            debug=True,
         )
 
         fake_report = {"folder": ".", "f1": 0.7}
@@ -400,6 +401,7 @@ class TestOrchestrate:
             patch("pipeline_orchestrator.run_bfs_stage", return_value=fake_bfs_result) as mock_bfs,
             patch("pipeline_orchestrator.run_rearrange_stage", return_value=rearrange_path) as mock_rearr,
             patch("pipeline_orchestrator.run_evaluation_stage", return_value=None),
+            patch("pipeline_orchestrator.run_map_stage", return_value=None),
         ):
             result = orchestrate(cfg)
 
@@ -429,6 +431,7 @@ class TestOrchestrate:
             patch("pipeline_orchestrator.run_bfs_stage") as mock_bfs,
             patch("pipeline_orchestrator.run_rearrange_stage", return_value=rearrange_path),
             patch("pipeline_orchestrator.run_evaluation_stage", return_value=None),
+            patch("pipeline_orchestrator.run_map_stage", return_value=None),
         ):
             result = orchestrate(cfg)
 
@@ -485,6 +488,7 @@ class TestOrchestrate:
             patch("pipeline_orchestrator.run_bfs_stage"),
             patch("pipeline_orchestrator.run_rearrange_stage", return_value=rearrange_path),
             patch("pipeline_orchestrator.run_evaluation_stage", return_value=fake_report),
+            patch("pipeline_orchestrator.run_map_stage", return_value=None),
         ):
             result = orchestrate(cfg)
 
@@ -518,19 +522,21 @@ class TestOrchestrate:
             run_mode=RunMode.BFS_AND_REARRANGE,
         )
 
-        bfs_paths = {
-            "final_paths": str(tmp_project / "outputs" / "bfs_v4_final_paths.json"),
-            "tree": str(tmp_project / "outputs" / "bfs_v4_tree.json"),
-        }
+        fake_bfs_result = BfsStageResult(
+            traversal_result=MagicMock(),
+            final_paths_json_path=str(tmp_project / "outputs" / "bfs_v5_final_paths.json"),
+            missing_from_db=[],
+        )
 
         with caplog.at_level(logging.INFO, logger="pipeline_orchestrator"):
             with (
-                patch("pipeline_orchestrator.run_bfs_stage", return_value=bfs_paths),
+                patch("pipeline_orchestrator.run_bfs_stage", return_value=fake_bfs_result),
                 patch(
                     "pipeline_orchestrator.run_rearrange_stage",
                     return_value=str(tmp_project / "out" / "tree.json"),
                 ),
                 patch("pipeline_orchestrator.run_evaluation_stage", return_value=None),
+                patch("pipeline_orchestrator.run_map_stage", return_value=None),
             ):
                 orchestrate(cfg)
 

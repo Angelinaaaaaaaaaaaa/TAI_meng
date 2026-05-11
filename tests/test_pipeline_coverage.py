@@ -223,6 +223,7 @@ class TestOrchestrateEdgeCases:
             patch("pipeline_orchestrator.run_bfs_stage"),
             patch("pipeline_orchestrator.run_rearrange_stage", return_value=tree_path),
             patch("pipeline_orchestrator.run_evaluation_stage", return_value={"f1": 0.6}) as mock_eval,
+            patch("pipeline_orchestrator.run_map_stage", return_value=None),
         ):
             result = orchestrate(cfg)
 
