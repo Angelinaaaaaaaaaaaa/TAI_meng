@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
 
-from utils import create_path_repr
+from reorganization_utils import create_path_repr
 
 class File:
     def __init__(self, path, file_hash):

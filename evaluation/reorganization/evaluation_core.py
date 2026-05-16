@@ -125,3 +125,7 @@ def evaluate_bottom_up(ground_truth_dict, prediction_dict, limit):
 
     *_, eval_info = _get_folder_score(Folder(Path('.')), limit)
     return eval_info
+
+def get_comparison(ground_truth_dict, prediction_dict):
+    ground_truth_files = {file: file for children in ground_truth_dict.values() for file in children["files"]}
+    return [{"ground_truth": str(ground_truth_files[file].path), "prediction": str(file.path)} for children in prediction_dict.values() for file in children["files"]]

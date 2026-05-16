@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 from collections import defaultdict
 
-from utils import create_path_repr, normalize_ground_truth_path, normalize_db_path_find_hashes
+from reorganization_utils import create_path_repr, normalize_ground_truth_path, normalize_db_path_find_hashes
 from file_folder_objects import File, Folder
 
 def get_ground_truth_hashes(db_path):
@@ -54,15 +54,24 @@ def construct_tree_from_json(ground_truth_hashes, final_paths_file):
 
     return prediction_tree
 
-def create_folder_children_dict(path, output, hashes):
-    path_repr = Folder(create_path_repr(path))
+def create_folder_children_dict(hashes):
+    ground_truth_tree = {}
 
-    output[path_repr] = {"files": set(), "subfolders": set()}
+    def _create_subfolder(path):
+        path_repr = Folder(create_path_repr(path))
 
-    for item in path.iterdir():
-        if item.is_file():
-            output[path_repr]["files"].add(File(item, hashes[normalize_ground_truth_path(item)]))
-        elif item.is_dir():
-            output[path_repr]["subfolders"].add(Folder(create_path_repr(item)))
+        ground_truth_tree[path_repr] = {"files": set(), "subfolders": set()}
 
-            create_folder_children_dict(item, output, hashes)
+        for item in path.iterdir():
+            item_long_path =  Path(f"\\\\?\\{item.resolve()}")
+            
+            if item_long_path.is_file():
+                ground_truth_tree[path_repr]["files"].add(File(item, hashes[normalize_ground_truth_path(item)]))
+            elif item_long_path.is_dir():
+                ground_truth_tree[path_repr]["subfolders"].add(Folder(create_path_repr(item)))
+
+                _create_subfolder(item)
+
+    _create_subfolder(Path("."))
+
+    return ground_truth_tree
