@@ -40,6 +40,8 @@ from classify_v4 import (
     ClassificationResult,
     collect_all_files,
 )
+from dotenv import load_dotenv
+load_dotenv(".env")
 
 logger = logging.getLogger(__name__)
 
@@ -66,19 +68,6 @@ MAX_SEQUENCE_CONTEXT_ITEMS = 80
 MAX_SEQUENCE_DESCRIPTION_CHARS = 240
 MAX_SEQUENCE_ITEM_DESCRIPTION_CHARS = 360
 
-PRESET_TASK_NAMES: Set[str] = {
-    "announcements",
-    "administrative",
-    "boardwork",
-    "discussion",
-    "homework",
-    "lab",
-    "slides",
-    "project",
-    "quiz",
-    "resources",
-}
-TASK_KEYWORDS = set(PRESET_TASK_NAMES)
 TASK_NAME_ALIASES: Dict[str, Set[str]] = {
     "discussion": {"disc", "section", "worksheet"},
     "homework": {"hw"},
@@ -103,72 +92,93 @@ def normalize_task_name_for_category(
         return None
     if task in {"study", "practice", "support", "skip"}:
         return None
+    if task and re.search(r"\.[a-z0-9]{1,8}$", task):
+        return None
+    if task and re.fullmatch(r"(?:disc|discussion)\s*0*\d+[a-z]?", task):
+        return "discussion"
+    if task and (
+        ("review" in task and re.search(r"\b(final|midterm)\b|\b(su|sp|fa)\d{2}\b", task))
+        or "final walkthrough" in task
+    ):
+        return "review"
     return task
 
 
-def explicit_task_name_from_source(source_rel: str) -> Optional[str]:
-    """Return a preset task when filename tokens explicitly match one."""
-    stem = os.path.splitext(os.path.basename(source_rel))[0].lower()
-    tokens = {token for token in re.split(r"[^a-z0-9]+", stem) if token}
-    preset_matches = sorted(tokens & PRESET_TASK_NAMES)
-    if preset_matches:
-        return preset_matches[0]
+def normalize_task_name_for_source(
+    raw: Optional[str],
+    category: Optional[str],
+    source_rel: str,
+) -> Optional[str]:
+    """Normalize task labels using source path context."""
+    task = normalize_task_name_for_category(raw, category)
+    cat = (category or "").strip().lower()
+    if cat == "study" and _source_is_discussion_flow(source_rel):
+        return "discussion"
+    return task
 
-    # Match tokens like 'lab2', 'slides03', 'homework5' — preset name + trailing digits.
-    # re.split keeps alphanumeric together, so 'lab2' stays as one token and misses the
-    # exact-match check above. Catch these with a suffix-digit pattern here.
-    preset_digit_pattern = re.compile(
-        r"^(" + "|".join(re.escape(p) for p in sorted(PRESET_TASK_NAMES)) + r")\d+[a-z]?$"
+
+def _source_is_discussion_flow(source_rel: str) -> bool:
+    path = source_rel.lower().replace("\\", "/")
+    normalized = re.sub(r"[^a-z0-9]+", "", source_rel.lower())
+    return (
+        "/disc/" in path
+        or "discussion" in normalized
+        or re.search(r"(?:^|/)disc\s*0*\d+", path) is not None
+        or re.search(r"(?:^|/)disc\d+", path) is not None
     )
-    for token in sorted(tokens):
-        m = preset_digit_pattern.fullmatch(token)
-        if m:
-            return m.group(1)
 
-    for task_name, aliases in TASK_NAME_ALIASES.items():
-        if task_name not in PRESET_TASK_NAMES:
-            continue
-        alias_pattern = re.compile(
-            r"^(?:" + "|".join(re.escape(alias) for alias in sorted(aliases)) + r")\d+[a-z]?$"
-        )
-        if tokens & aliases or any(alias_pattern.fullmatch(token) for token in tokens):
-            return task_name
+
+def _discussion_sequence_from_source(source_rel: str) -> Optional[str]:
+    """Use the discussion/session marker from the path, not a per-file clip number."""
+    path = source_rel.replace("\\", "/")
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return None
+
+    # Folder names carry the shared bundle sequence for recordings such as:
+    # youtube/[CS 61A SU25] Discussion 6/3-Bear.webm
+    for part in parts[:-1]:
+        seq = _discussion_sequence_from_path_part(part)
+        if seq:
+            return seq
+
+    # Fall back to the filename only when the discussion marker is in the file itself.
+    seq = _discussion_sequence_from_path_part(os.path.splitext(parts[-1])[0])
+    if seq:
+        return seq
+
     return None
 
 
-def task_name_from_source_context(
-    source_rel: str,
-    category: Optional[str],
-    fallback: Optional[str] = None,
-) -> Optional[str]:
-    """Apply deterministic source-path task rules before falling back."""
-    explicit = explicit_task_name_from_source(source_rel)
-    if explicit:
-        return explicit
+def _discussion_sequence_from_path_part(part: str) -> Optional[str]:
+    """Extract discussion sequence from one path component without absorbing topic text."""
+    tokens = [t for t in re.split(r"[^a-z0-9]+", part.lower()) if t]
+    for i, token in enumerate(tokens):
+        if token not in {"discussion", "disc"}:
+            continue
+        if i + 1 >= len(tokens):
+            continue
+        marker = tokens[i + 1]
+        if re.fullmatch(r"\d+[a-z]?", marker):
+            return f"discussion_{_canonical_sequence_marker(marker)}"
 
-    if (category or "").lower() == Category.STUDY.value:
-        folders = source_rel.replace("\\", "/").split("/")[:-1]
-        if any(part.lower() in {"lec", "lecture", "lectures"} for part in folders):
-            return "slides"
+    for token in tokens:
+        match = re.fullmatch(r"(?:discussion|disc)(\d+[a-z]?)", token)
+        if match:
+            return f"discussion_{_canonical_sequence_marker(match.group(1))}"
 
-    return fallback
+    return None
 
 
-def folder_has_explicit_file_task_split(
-    files: List[FileMeta],
-    inherited_task_name: Optional[str],
-) -> bool:
-    """Return true when direct folder assignment would hide explicit file tasks."""
-    explicit_tasks = {
-        task
-        for f in files
-        for task in [explicit_task_name_from_source(f.source_path)]
-        if task
-    }
-    if not explicit_tasks:
-        return False
-    inherited = normalize_task_name(inherited_task_name)
-    return any(task != inherited for task in explicit_tasks)
+def _review_sequence_from_source(source_rel: str) -> Optional[str]:
+    """Bundle review recordings by review type instead of per-clip numbers."""
+    path = source_rel.replace("\\", "/").lower()
+    normalized = re.sub(r"[^a-z0-9]+", "", path)
+    if "midtermreview" in normalized:
+        return "midterm_review"
+    if "finalreview" in normalized or "finalwalkthrough" in normalized:
+        return "final_review"
+    return None
 
 
 def compact_text(text: Optional[str], max_chars: int) -> str:
@@ -417,21 +427,42 @@ class CourseDB:
             raise RuntimeError("Database not connected. Call db.connect() first.")
         return self.conn
 
+    def _file_columns(self) -> Set[str]:
+        conn = self._ensure_connected()
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(file)")
+        return {str(row["name"]) for row in cur.fetchall()}
+
     def load_file_index(self) -> Dict[str, FileIndexEntry]:
         """Load all files from DB into an index keyed by file_name."""
         conn = self._ensure_connected()
         cur = conn.cursor()
-        cur.execute(
-            "SELECT uuid, file_name, description, "
-            "relative_path, extra_info, file_hash FROM file"
-        )
+        columns = self._file_columns()
+        required_columns = {"uuid"}
+        missing_required = required_columns - columns
+        if missing_required:
+            raise RuntimeError(
+                "DB table `file` missing required column(s): "
+                + ", ".join(sorted(missing_required))
+            )
+
+        optional_columns = [
+            "file_name",
+            "description",
+            "original_path",
+            "relative_path",
+            "extra_info",
+            "file_hash",
+        ]
+        select_cols = ["uuid"] + [col for col in optional_columns if col in columns]
+        cur.execute(f"SELECT {', '.join(select_cols)} FROM file")
         rows = cur.fetchall()
 
         index: Dict[str, FileIndexEntry] = {}
         for r in rows:
-            fname = r["file_name"] or ""
+            fname = r["file_name"] if "file_name" in columns else ""
             if not fname:
-                rel = r["relative_path"] or ""
+                rel = r["relative_path"] if "relative_path" in columns else ""
                 fname = os.path.basename(rel) if rel else ""
             if not fname:
                 continue
@@ -439,10 +470,11 @@ class CourseDB:
             entry = FileIndexEntry(
                 uuid=r["uuid"],
                 file_name=fname,
-                description=r["description"] or "",
-                original_path=r["relative_path"] or "",
-                extra_info=r["extra_info"] or "",
-                file_hash=r["file_hash"] or None,
+                description=(r["description"] if "description" in columns else "") or "",
+                original_path=(r["original_path"] if "original_path" in columns else "") or "",
+                relative_path=(r["relative_path"] if "relative_path" in columns else "") or "",
+                extra_info=(r["extra_info"] if "extra_info" in columns else "") or "",
+                file_hash=(r["file_hash"] if "file_hash" in columns else None) or None,
             )
             if fname not in index:
                 index[fname] = entry
@@ -736,6 +768,7 @@ class BFSTraverser:
         source_path: str,
         max_depth: Optional[int] = None,
         debug: bool = False,
+        debug_log_path: str = LLM_DEBUG_LOG_FILE,
     ) -> TraversalResult:
         """Main entry point: run the full BFS pipeline.
 
@@ -792,8 +825,6 @@ class BFSTraverser:
             f"{len(result.missing_from_db)} missing_from_db (excluded from processing)"
         )
 
-        if debug:
-            self.classifier.save_debug_log(LLM_DEBUG_LOG_FILE)
         return result
 
     def _bfs_classify(
@@ -808,7 +839,7 @@ class BFSTraverser:
         mappings: Dict[str, FileMapping] = {}
 
         seen: Set[str] = set()
-        known_task_names: Set[str] = set(PRESET_TASK_NAMES)
+        known_task_names: Set[str] = set()
         ancestor_desc_map: Dict[str, List[str]] = {}
         task_context_map: Dict[str, tuple] = {}
         task_queue: deque[Union[FolderNode, FileMeta]] = deque()
@@ -893,9 +924,10 @@ class BFSTraverser:
                 ancestor_descriptions=my_ancestors,
                 known_task_names=known_task_names,
             )
-            result.task_name = normalize_task_name_for_category(
+            result.task_name = normalize_task_name_for_source(
                 task_result.task_name,
                 result.category.value,
+                item.path,
             )
             if result.task_name and known_task_names is not None:
                 known_task_names.add(result.task_name)
@@ -916,16 +948,13 @@ class BFSTraverser:
         current_task_name = result.task_name or my_task_name
         current_seq_name = result.sequence_name or my_seq_name
 
-        def _child_task_ctx(child_name: str) -> tuple:
+        def _child_task_ctx(child_path: str, child_name: str) -> tuple:
             if result.by_type:
-                child_task_name = current_task_name or explicit_task_name_from_source(child_name)
-                child_seq_name = _extract_sequence_from_filename(child_name, child_task_name)
-                if child_task_name and child_seq_name and is_supported_sequence_name(child_seq_name):
-                    if known_task_names is not None:
-                        known_task_names.add(child_task_name)
-                    return (child_task_name, child_seq_name)
-
-                child_task_name = normalize_task_name(child_name)
+                child_task_name = normalize_task_name_for_source(
+                    child_name,
+                    result.category.value,
+                    child_path,
+                )
                 if child_task_name and known_task_names is not None:
                     known_task_names.add(child_task_name)
                 return (child_task_name, None)
@@ -945,7 +974,7 @@ class BFSTraverser:
             )
             for child in item.children.values():
                 ancestor_desc_map[child.path] = child_ancestors
-                task_context_map[child.path] = _child_task_ctx(child.name)
+                task_context_map[child.path] = _child_task_ctx(child.path, child.name)
                 task_queue.append(child)
             ancestor_desc_map[item.path] = child_ancestors
             for f in item.files:
@@ -967,7 +996,7 @@ class BFSTraverser:
             )
             for child in item.children.values():
                 ancestor_desc_map[child.path] = child_ancestors
-                task_context_map[child.path] = _child_task_ctx(child.name)
+                task_context_map[child.path] = _child_task_ctx(child.path, child.name)
                 task_queue.append(child)
             ancestor_desc_map[item.path] = child_ancestors
             for f in item.files:
@@ -988,31 +1017,7 @@ class BFSTraverser:
             )
             for child in item.children.values():
                 ancestor_desc_map[child.path] = child_ancestors
-                task_context_map[child.path] = _child_task_ctx(child.name)
-                task_queue.append(child)
-            ancestor_desc_map[item.path] = child_ancestors
-            for f in item.files:
-                task_context_map[f.source_path] = (current_task_name, current_seq_name)
-                task_queue.append(f)
-            return
-
-        if folder_has_explicit_file_task_split(folder_files, current_task_name):
-            result.task_name = None
-            result.sequence_name = None
-            result.category_depth = 0
-            classifications[item.path] = Classification(
-                path=item.path,
-                category=result.category,
-                reason=result.reason + " [explicit file task split, descended]",
-                classified_at_level="folder",
-                ancestor_descriptions=list(my_ancestors),
-            )
-            logger.info(
-                f"[BFS]   -> Explicit file task split, descending with {len(child_ancestors)} parent-level context entries"
-            )
-            for child in item.children.values():
-                ancestor_desc_map[child.path] = child_ancestors
-                task_context_map[child.path] = _child_task_ctx(child.name)
+                task_context_map[child.path] = _child_task_ctx(child.path, child.name)
                 task_queue.append(child)
             ancestor_desc_map[item.path] = child_ancestors
             for f in item.files:
@@ -1047,16 +1052,8 @@ class BFSTraverser:
             )
 
             top = top_level_folder(f.source_path)
-            file_task = task_name_from_source_context(
-                f.source_path,
-                result.category.value,
-                current_task_name,
-            )
+            file_task = current_task_name
             file_seq = current_seq_name
-            if file_task != current_task_name:
-                file_seq = None
-                if known_task_names is not None:
-                    known_task_names.add(file_task)
             category_depth = category_depth_for(
                 f.source_path,
                 file_task,
@@ -1106,9 +1103,10 @@ class BFSTraverser:
                     ancestor_descriptions=file_ancestors,
                     known_task_names=known_task_names,
                 )
-                result.task_name = normalize_task_name_for_category(
+                result.task_name = normalize_task_name_for_source(
                     task_result.task_name,
                     result.category.value,
+                    item.source_path,
                 )
                 if result.task_name and known_task_names is not None:
                     known_task_names.add(result.task_name)
@@ -1139,16 +1137,6 @@ class BFSTraverser:
         )
         file_task = result.task_name or file_task
         file_seq = result.sequence_name or file_seq
-        contextual_task = task_name_from_source_context(
-            item.source_path,
-            result.category.value,
-            file_task,
-        )
-        if contextual_task != file_task:
-            file_task = contextual_task
-            file_seq = None
-            if known_task_names is not None:
-                known_task_names.add(file_task)
         category_depth = category_depth_for(
             item.source_path,
             file_task,
@@ -1304,6 +1292,7 @@ def export_tree_json(
         "result_tree": result_tree,
     }
 
+    ensure_output_parent(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -1361,9 +1350,13 @@ def execute_moves(
 
 def collect_task_names(mappings: Dict[str, FileMapping]) -> Set[str]:
     """Collect the known task-name set from mappings with an identified task."""
-    names: Set[str] = set(PRESET_TASK_NAMES)
+    names: Set[str] = set()
     for m in mappings.values():
-        task_name = normalize_task_name_for_category(m.task_name, m.category)
+        task_name = normalize_task_name_for_source(
+            m.task_name,
+            m.category,
+            m.source_rel,
+        )
         if task_name:
             m.task_name = task_name
             m.category_depth = category_depth_for(
@@ -1410,7 +1403,7 @@ def rematch_missing_task_names(
             ancestor_descriptions=ancestor_descs,
         )
 
-        inferred = normalize_task_name_for_category(inferred, m.category)
+        inferred = normalize_task_name_for_source(inferred, m.category, m.source_rel)
         if not inferred or inferred not in known_task_names:
             continue
 
@@ -1443,6 +1436,14 @@ def _extract_sequence_from_filename(
 
     first = parts[0]
 
+    boardwork_seq = _boardwork_sequence_from_filename_parts(parts, task_name)
+    if boardwork_seq:
+        return boardwork_seq
+
+    task_specific = _task_sequence_from_adjacent_tokens(parts, task_name)
+    if task_specific:
+        return task_specific
+
     if re.fullmatch(r'\d+', first):
         text_prefix = _filename_text_prefix_after_numeric(parts, task_name)
         numeric_parts = []
@@ -1452,6 +1453,8 @@ def _extract_sequence_from_filename(
                 continue
             break
         digit_seq = "_".join(numeric_parts)
+        if normalize_task_name(task_name) == "lecture":
+            return f"lecture_{_canonical_sequence_marker(digit_seq)}"
         return f"{text_prefix}_{digit_seq}" if text_prefix else digit_seq
 
     if len(parts) >= 3 and re.fullmatch(r'\d{1,2}', parts[-2]) and re.fullmatch(r'\d{1,2}', parts[-1]):
@@ -1481,6 +1484,50 @@ def _extract_sequence_from_filename(
         )
         if typed:
             return typed
+
+    return None
+
+
+def _boardwork_sequence_from_filename_parts(
+    parts: List[str],
+    task_name: Optional[str],
+) -> Optional[str]:
+    """Extract explicit boardwork markers like boardwork_1_31 as 1_31."""
+    if normalize_task_name(task_name) != "boardwork":
+        return None
+    if not parts or re.sub(r"[^a-z0-9]+", "", parts[0].lower()) != "boardwork":
+        return None
+
+    numeric_parts: List[str] = []
+    for part in parts[1:]:
+        if not re.fullmatch(r"\d+", part):
+            break
+        numeric_parts.append(part)
+
+    if not numeric_parts:
+        return None
+    return "_".join(numeric_parts)
+
+
+def _task_sequence_from_adjacent_tokens(
+    parts: List[str],
+    task_name: Optional[str],
+) -> Optional[str]:
+    """Prefer explicit task markers like Project_4 over term/year prefixes."""
+    task = normalize_task_name(task_name)
+    if not task:
+        return None
+
+    aliases = TASK_NAME_ALIASES.get(task, set()) | {task}
+    for i, part in enumerate(parts[:-1]):
+        normalized = re.sub(r"[^a-z0-9]+", "", part.lower())
+        if normalized not in aliases:
+            continue
+
+        marker = parts[i + 1]
+        if not re.fullmatch(r"\d+[A-Za-z]?", marker):
+            continue
+        return f"{task}_{_canonical_sequence_marker(marker)}"
 
     return None
 
@@ -1582,6 +1629,11 @@ def is_supported_sequence_name(seq: Optional[str]) -> bool:
         return False
 
     normalized = re.sub(r"[^a-z0-9]+", "", seq.lower())
+    if normalized == "finalproject":
+        return True
+    if normalized in {"finalreview", "midtermreview"}:
+        return True
+
     if not re.search(r"\d", normalized):
         return False
 
@@ -1604,6 +1656,26 @@ def is_supported_sequence_name(seq: Optional[str]) -> bool:
         r"fall\d{4}",
     ]
     return any(re.fullmatch(pattern, normalized) for pattern in typed_patterns)
+
+
+def is_sequence_name_valid_for_task(
+    seq: Optional[str],
+    task_name: Optional[str],
+) -> bool:
+    """Validate sequence labels with task context so term markers do not become content sequence."""
+    if not is_supported_sequence_name(seq):
+        return False
+
+    normalized_seq = re.sub(r"[^a-z0-9]+", "", (seq or "").lower())
+    task = normalize_task_name(task_name)
+    if task == "review":
+        return normalized_seq in {"finalreview", "midtermreview"}
+    if task == "boardwork":
+        return bool(re.fullmatch(r"\d+(?:_\d+)*[a-z]?", (seq or "").lower()))
+    if re.fullmatch(r"(spring|fall)\d{4}", normalized_seq):
+        return task in {"homework", "lab", "project", "discussion"}
+
+    return True
 
 
 def fill_sequence_names(
@@ -1640,9 +1712,10 @@ def fill_sequence_names(
 
         if folder_decisions:
             for path, decision in folder_decisions.items():
-                task_name = normalize_task_name_for_category(
+                task_name = normalize_task_name_for_source(
                     decision.task_name,
                     decision.category.value,
+                    path,
                 )
                 decision.task_name = task_name
                 if not task_name or decision.sequence_name:
@@ -1700,7 +1773,12 @@ def fill_sequence_names(
                         folder_decision.by_sequence = decision.by_sequence
 
                     seq = (decision.seq_name or "").strip() or None
-                    if seq and not is_supported_sequence_name(seq):
+                    task_for_validation = (
+                        target.task_name
+                        if target_type == "file"
+                        else target[1].task_name
+                    )
+                    if seq and not is_sequence_name_valid_for_task(seq, task_for_validation):
                         logger.debug(
                             f"[FILL_SEQ] rejected unsupported sequence {seq!r} for {source_path}"
                         )
@@ -1745,13 +1823,23 @@ def fill_sequence_names(
 
         filename = os.path.basename(m.source_rel)
         seq = _extract_sequence_from_filename(filename, m.task_name)
+        if seq and not is_sequence_name_valid_for_task(seq, m.task_name):
+            logger.debug(
+                f"[FILL_SEQ] rejected unsupported filename sequence {seq!r} for {filename}"
+            )
+            seq = None
 
         if not seq:
             seq = _extract_sequence_from_path_components(m.source_rel, m.task_name)
+        if seq and not is_sequence_name_valid_for_task(seq, m.task_name):
+            logger.debug(
+                f"[FILL_SEQ] rejected unsupported path sequence {seq!r} for {filename}"
+            )
+            seq = None
 
         if not seq and file_index:
             seq = _extract_sequence_from_db(filename, file_index)
-        if seq and not is_supported_sequence_name(seq):
+        if seq and not is_sequence_name_valid_for_task(seq, m.task_name):
             logger.debug(
                 f"[FILL_SEQ] rejected unsupported fallback sequence {seq!r} for {filename}"
             )
@@ -1800,7 +1888,7 @@ def _apply_explicit_sequence_overrides(mappings: List[FileMapping]) -> int:
             continue
 
         explicit_seq = _derive_sequence_from_path(m.source_rel, m.task_name)
-        if not explicit_seq or not is_supported_sequence_name(explicit_seq):
+        if not explicit_seq or not is_sequence_name_valid_for_task(explicit_seq, m.task_name):
             continue
         if m.sequence_name == explicit_seq:
             continue
@@ -1834,7 +1922,7 @@ def _apply_folder_sequences_to_mappings(
         )
         if not seq or not task_name:
             continue
-        if not is_supported_sequence_name(seq):
+        if not is_sequence_name_valid_for_task(seq, task_name):
             continue
         normalized_path = folder_path.strip("/")
         sequence_folders.append((normalized_path, decision, task_name, seq))
@@ -1880,11 +1968,22 @@ def canonicalize_sequence_names_by_task(
     changed = 0
 
     for mapping in mappings:
-        mapping.task_name = normalize_task_name_for_category(
+        mapping.task_name = normalize_task_name_for_source(
             mapping.task_name,
             mapping.category,
+            mapping.source_rel,
         )
-        if mapping.sequence_name and not is_supported_sequence_name(mapping.sequence_name):
+        normalized_seq = normalize_sequence_name_for_task(
+            mapping.sequence_name,
+            mapping.task_name,
+        )
+        if mapping.sequence_name != normalized_seq:
+            mapping.sequence_name = normalized_seq
+            changed += 1
+        if mapping.sequence_name and not is_sequence_name_valid_for_task(
+            mapping.sequence_name,
+            mapping.task_name,
+        ):
             mapping.sequence_name = None
             changed += 1
         key = _sequence_canonical_key(
@@ -1896,12 +1995,23 @@ def canonicalize_sequence_names_by_task(
             candidates.setdefault(key, []).append(("file", mapping))
 
     if folder_decisions:
-        for decision in folder_decisions.values():
-            decision.task_name = normalize_task_name_for_category(
+        for path, decision in folder_decisions.items():
+            decision.task_name = normalize_task_name_for_source(
                 decision.task_name,
                 decision.category.value,
+                path,
             )
-            if decision.sequence_name and not is_supported_sequence_name(decision.sequence_name):
+            normalized_seq = normalize_sequence_name_for_task(
+                decision.sequence_name,
+                decision.task_name,
+            )
+            if decision.sequence_name != normalized_seq:
+                decision.sequence_name = normalized_seq
+                changed += 1
+            if decision.sequence_name and not is_sequence_name_valid_for_task(
+                decision.sequence_name,
+                decision.task_name,
+            ):
                 decision.sequence_name = None
                 changed += 1
             key = _sequence_canonical_key(
@@ -1936,8 +2046,8 @@ def _sequence_canonical_key(
     category: str,
     task_name: Optional[str],
     sequence_name: Optional[str],
-) -> Optional[Tuple[str, str, str]]:
-    """Group sequence aliases like hw3 and Homework_3 by task plus number marker."""
+) -> Optional[Tuple[str, str, str, str]]:
+    """Group true aliases like hw3/Homework_3 without merging unrelated type prefixes."""
     task = normalize_task_name(task_name)
     seq = (sequence_name or "").strip()
     if not category or not task or not seq:
@@ -1948,7 +2058,53 @@ def _sequence_canonical_key(
     if not numbers:
         return None
 
-    return (category, task, numbers[-1])
+    family = _sequence_label_family(normalized, task)
+    return (category, task, family, numbers[-1])
+
+
+def normalize_sequence_name_for_task(
+    sequence_name: Optional[str],
+    task_name: Optional[str],
+) -> Optional[str]:
+    """Normalize task-prefixed sequence labels like proj0/project0 to project_0."""
+    seq = (sequence_name or "").strip()
+    task = normalize_task_name(task_name)
+    if not seq or not task:
+        return seq or None
+
+    normalized = re.sub(r"[^a-z0-9]+", "", seq.lower())
+    match = re.fullmatch(r"([a-z]+)(\d+[a-z]?)", normalized)
+    if not match:
+        return seq
+
+    prefix, marker = match.groups()
+    aliases = TASK_NAME_ALIASES.get(task, set()) | {task}
+    if prefix not in aliases:
+        return seq
+
+    return f"{task}_{_canonical_sequence_marker(marker)}"
+
+
+def _sequence_label_family(normalized_sequence: str, task_name: str) -> str:
+    """Return the textual sequence family so lec2/lab2/part2 stay distinct."""
+    match = re.search(r"\d", normalized_sequence)
+    if not match:
+        return task_name
+
+    prefix = normalized_sequence[:match.start()]
+    if not prefix:
+        return task_name
+
+    aliases = {
+        "disc": "discussion",
+        "section": "discussion",
+        "worksheet": "discussion",
+        "hw": "homework",
+        "proj": "project",
+        "lec": "lecture",
+        "boardwork": "boardwork",
+    }
+    return aliases.get(prefix, prefix)
 
 
 def _choose_canonical_sequence_label(labels) -> Optional[str]:
@@ -1980,7 +2136,7 @@ def _sequence_task_group_context(
     for mapping in sorted(mappings, key=lambda m: m.source_rel):
         if mapping.category != category:
             continue
-        if normalize_task_name_for_category(mapping.task_name, mapping.category) != normalized_task:
+        if normalize_task_name_for_source(mapping.task_name, mapping.category, mapping.source_rel) != normalized_task:
             continue
 
         payload = _sequence_batch_payload(mapping, file_index, classifications)
@@ -2001,7 +2157,7 @@ def _sequence_task_group_context(
         for path, decision in sorted(folder_decisions.items()):
             if decision.category.value != category:
                 continue
-            if normalize_task_name_for_category(decision.task_name, decision.category.value) != normalized_task:
+            if normalize_task_name_for_source(decision.task_name, decision.category.value, path) != normalized_task:
                 continue
 
             description_parts = [
@@ -2113,6 +2269,15 @@ def _derive_sequence_from_path(source_rel: str, task_name: Optional[str]) -> Opt
     """
     Legacy wrapper — delegates to the new helpers.
     """
+    if normalize_task_name(task_name) == "discussion":
+        discussion_seq = _discussion_sequence_from_source(source_rel)
+        if discussion_seq:
+            return discussion_seq
+    if normalize_task_name(task_name) == "review":
+        review_seq = _review_sequence_from_source(source_rel)
+        if review_seq:
+            return review_seq
+
     filename = os.path.basename(source_rel)
     return (
         _extract_sequence_from_filename(filename, task_name)
@@ -2207,21 +2372,20 @@ def flatten_single_file_folders(paths_by_source: Dict[str, str]) -> Dict[str, st
 
 
 def apply_flattened_final_paths(mappings: Dict[str, FileMapping]) -> None:
-    """Build final paths, flatten one-file folders, and store them in mappings."""
+    """Build final paths and store them in mappings."""
     final_paths = {
         source: build_final_path(mapping)
         for source, mapping in mappings.items()
     }
-    flattened_paths = flatten_single_file_folders(final_paths)
 
     changed = 0
-    for source, final_path in flattened_paths.items():
+    for source, final_path in final_paths.items():
         mapping = mappings[source]
         if mapping.dest_rel != final_path:
             changed += 1
         mapping.dest_rel = final_path
 
-    logger.info("[FLATTEN] Updated %d destination paths", changed)
+    logger.info("[FINAL_PATHS] Updated %d destination paths", changed)
 
 
 def export_final_paths_json(
@@ -2273,6 +2437,7 @@ def export_final_paths_json(
         "all_final_paths": all_items,
     }
 
+    ensure_output_parent(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
@@ -2412,6 +2577,7 @@ def generate_report(
             lines.append(f"- ... and {len(result.files_stale_in_db) - 30} more")
         lines.append("")
 
+    ensure_output_parent(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
@@ -2475,9 +2641,23 @@ def export_mappings_json(result: TraversalResult, out_path: str = PLAN_JSON_FILE
         "files_missing_in_db": result.files_missing_in_db,
         "missing_from_db": result.missing_from_db,
     }
+    ensure_output_parent(out_path)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"Exported plan to {out_path}")
+
+
+def ensure_output_parent(output_path: str) -> None:
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def resolve_output_path(output_folder: str, output_path: str) -> str:
+    """Place relative generated-output paths under output_folder when provided."""
+    if not output_folder or os.path.isabs(output_path):
+        return output_path
+    return os.path.join(output_folder, output_path)
 
 
 def bfs_reorganize_v5(
@@ -2488,6 +2668,7 @@ def bfs_reorganize_v5(
     json_path: str = PLAN_JSON_FILE,
     tree_path: str = TREE_JSON_FILE,
     final_paths_path: str = FINAL_PATHS_JSON_FILE,
+    debug_log_path: str = LLM_DEBUG_LOG_FILE,
     dest_dir: Optional[str] = None,
     debug: bool = False,
 ) -> TraversalResult:
@@ -2497,7 +2678,11 @@ def bfs_reorganize_v5(
     try:
         classifier = LLMClassifier(model=model)
         traverser = BFSTraverser(db, classifier)
-        result = traverser.traverse(course_root, debug=debug)
+        result = traverser.traverse(
+            course_root,
+            debug=debug,
+            debug_log_path=debug_log_path,
+        )
 
         known_task_names = collect_task_names(result.mappings)
         rematch_missing_task_names(
@@ -2515,11 +2700,11 @@ def bfs_reorganize_v5(
         apply_flattened_final_paths(result.mappings)
 
         export_final_paths_json(result, known_task_names, final_paths_path)
-
-        if debug:
-            export_tree_json(result, tree_path)
-            generate_report(result, classifier, report_path)
-            export_mappings_json(result, json_path)
+        export_tree_json(result, tree_path)
+        generate_report(result, classifier, report_path)
+        export_mappings_json(result, json_path)
+        ensure_output_parent(debug_log_path)
+        classifier.save_debug_log(debug_log_path)
 
         if dest_dir:
             execute_moves(result, course_root, dest_dir)
@@ -2603,6 +2788,10 @@ def main():
         help=f"Final structured paths JSON (default: {FINAL_PATHS_JSON_FILE})"
     )
     parser.add_argument(
+        "--output_folder", "--output-folder", default="",
+        help="Folder for generated output files. Empty means write to the current paths."
+    )
+    parser.add_argument(
         "--execute", action="store_true",
         help="Actually copy files to --dest (original source is kept intact)"
     )
@@ -2613,7 +2802,7 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument(
         "--debug", action="store_true",
-        help="Write intermediate files (plan JSON, tree JSON, report MD, LLM debug log)"
+        help="Deprecated: generated output files are written by default"
     )
 
     args = parser.parse_args()
@@ -2631,16 +2820,29 @@ def main():
         print("Error: OPENAI_API_KEY not set")
         sys.exit(1)
 
+    output_folder = args.output_folder.strip()
+    if output_folder:
+        os.makedirs(output_folder, exist_ok=True)
+
+    json_out = resolve_output_path(output_folder, args.json_out)
+    tree_out = resolve_output_path(output_folder, args.tree_out)
+    report = resolve_output_path(output_folder, args.report)
+    final_paths = resolve_output_path(output_folder, args.final_paths)
+    debug_log = resolve_output_path(output_folder, LLM_DEBUG_LOG_FILE)
+
     print("=" * 70)
     print("BFS v5 — Course File Reorganization Agent")
     print("=" * 70)
     print(f"Source:    {source}")
     print(f"DB:        {args.db}")
     print(f"Model:     {args.model}")
-    print(f"Plan:      {args.json_out}")
-    print(f"Tree:      {args.tree_out}")
-    print(f"Report:    {args.report}")
-    print(f"FinalPaths:{args.final_paths}")
+    if output_folder:
+        print(f"OutputDir: {os.path.abspath(output_folder)}")
+    print(f"Plan:      {json_out}")
+    print(f"Tree:      {tree_out}")
+    print(f"Report:    {report}")
+    print(f"FinalPaths:{final_paths}")
+    print(f"LLMDebug:  {debug_log}")
     if args.execute:
         print(f"Execute:   YES  ->  {args.dest}")
     else:
@@ -2651,10 +2853,11 @@ def main():
         course_root=source,
         db_path=args.db,
         model=args.model,
-        report_path=args.report,
-        json_path=args.json_out,
-        tree_path=args.tree_out,
-        final_paths_path=args.final_paths,
+        report_path=report,
+        json_path=json_out,
+        tree_path=tree_out,
+        final_paths_path=final_paths,
+        debug_log_path=debug_log,
         dest_dir=args.dest if args.execute else None,
         debug=args.debug,
     )

@@ -14,6 +14,7 @@ Notes (per your requirements):
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Set
@@ -270,9 +271,14 @@ def _category_depth(
     folder_parts = parts[:-1] if is_file else parts
 
     deepest = 0
+    solution_depth = _solution_wrapper_sequence_depth(folder_parts, sequence_name)
     targets = [v.lower() for v in (task_name, sequence_name) if v]
     for i, part in enumerate(folder_parts, 1):
-        if part.lower() in targets:
+        if part.lower() in targets or _path_part_mentions_task_or_sequence(
+            part,
+            task_name,
+            sequence_name,
+        ):
             deepest = max(deepest, i)
 
     if is_file and targets:
@@ -283,6 +289,8 @@ def _category_depth(
                 normalized_target and normalized_target in normalized_stem
             ):
                 deepest = max(deepest, len(folder_parts))
+        if _filename_mentions_sequence(filename_stem, task_name, sequence_name):
+            deepest = max(deepest, len(folder_parts))
 
     if model_depth > 0:
         deepest = max(deepest, model_depth)
@@ -290,7 +298,126 @@ def _category_depth(
     if targets and deepest == 0:
         deepest = len(folder_parts)
 
+    if solution_depth is not None:
+        deepest = solution_depth
+
     return min(deepest, len(folder_parts))
+
+
+def _solution_wrapper_sequence_depth(
+    folder_parts: List[str],
+    sequence_name: Optional[str],
+) -> Optional[int]:
+    """Anchor assignment sequence before sol-* folders so solution structure remains."""
+    if not sequence_name:
+        return None
+
+    seq_numbers = re.findall(r"\d+[a-z]?", sequence_name.lower())
+    if not seq_numbers:
+        return None
+
+    seq_marker = _canonical_sequence_marker(seq_numbers[-1])
+    for i, part in enumerate(folder_parts, 1):
+        normalized = re.sub(r"[^a-z0-9]+", "", part.lower())
+        if not normalized.startswith("sol"):
+            continue
+        part_numbers = re.findall(r"\d+[a-z]?", normalized)
+        if part_numbers and _canonical_sequence_marker(part_numbers[-1]) == seq_marker:
+            return max(i - 1, 0)
+
+    return None
+
+
+def _canonical_sequence_marker(marker: str) -> str:
+    """Normalize sequence markers so 1 and 01 compare equal."""
+    match = re.fullmatch(r"(\d+)([a-z]?)", marker.lower())
+    if not match:
+        return marker.lower()
+    number = str(int(match.group(1)))
+    return number + match.group(2)
+
+
+def _path_part_mentions_task_or_sequence(
+    part: str,
+    task_name: Optional[str],
+    sequence_name: Optional[str],
+) -> bool:
+    """Match folders like hw/hw03 against homework/Homework_3 metadata."""
+    normalized = re.sub(r"[^a-z0-9]+", "", part.lower())
+    if not normalized:
+        return False
+
+    task = _sanitize_task_name(task_name or "")
+    aliases_by_task = {
+        "discussion": {"disc", "section", "worksheet"},
+        "homework": {"hw"},
+        "lecture": {"lec"},
+        "project": {"proj"},
+    }
+    if task:
+        task_normalized = re.sub(r"[^a-z0-9]+", "", task)
+        if normalized == task_normalized:
+            return True
+        aliases = aliases_by_task.get(task, set())
+        if normalized in aliases:
+            return True
+    else:
+        aliases = set()
+
+    if not sequence_name:
+        return False
+
+    seq_numbers = re.findall(r"\d+[a-z]?", sequence_name.lower())
+    part_numbers = re.findall(r"\d+[a-z]?", normalized)
+    if not seq_numbers or not part_numbers:
+        return False
+    if _canonical_sequence_marker(seq_numbers[-1]) != _canonical_sequence_marker(part_numbers[-1]):
+        return False
+
+    if not task:
+        return True
+    if normalized.startswith(task):
+        return True
+    return any(normalized.startswith(alias) for alias in aliases)
+
+
+def _filename_mentions_sequence(
+    filename_stem: str,
+    task_name: Optional[str],
+    sequence_name: Optional[str],
+) -> bool:
+    """Return true when filename has the same sequence number as task sequence."""
+    if not sequence_name:
+        return False
+
+    seq_numbers = re.findall(r"\d+[a-z]?", sequence_name.lower())
+    file_numbers = re.findall(r"\d+[a-z]?", filename_stem.lower())
+    if not seq_numbers or not file_numbers:
+        return False
+    if _canonical_sequence_marker(seq_numbers[-1]) != _canonical_sequence_marker(file_numbers[-1]):
+        return False
+
+    task = _sanitize_task_name(task_name or "")
+    if not task:
+        return True
+
+    stem_tokens = {token for token in re.split(r"[^a-z0-9]+", filename_stem.lower()) if token}
+    if task in stem_tokens:
+        return True
+
+    aliases = {
+        "discussion": {"disc", "section", "worksheet"},
+        "homework": {"hw"},
+        "lecture": {"lec"},
+        "project": {"proj"},
+    }.get(task, set())
+    if aliases & stem_tokens:
+        return True
+
+    normalized_stem = re.sub(r"[^a-z0-9]+", "", filename_stem.lower())
+    return normalized_stem.startswith(task) or any(
+        normalized_stem.startswith(alias) for alias in aliases
+    )
 
 
 # ====================================================================
@@ -307,26 +434,6 @@ def collect_all_files(node: FolderNode) -> List[FileMeta]:
         for child in cur.children.values():
             queue.append(child)
     return files
-
-
-def _is_youtube_course_video(file_meta: FileMeta, file_desc: str = "") -> bool:
-    """Detect YouTube/course-video metadata files that should be study material."""
-    text = " ".join(
-        part
-        for part in [
-            file_meta.source_path,
-            file_meta.folder_path,
-            file_meta.file_name,
-            file_meta.description or "",
-            file_desc or "",
-        ]
-        if part
-    ).lower()
-    return (
-        "youtube" in text
-        or "youtu.be" in text
-        or "youtube.com" in text
-    )
 
 
 # ====================================================================
@@ -498,23 +605,6 @@ class LLMClassifier:
             file_desc = db_entry.description
         elif file_meta.description:
             file_desc = file_meta.description
-
-        if _is_youtube_course_video(file_meta, file_desc):
-            reason = "YouTube/course-video material is treated as study content because it contains course video."
-            self._log_call(
-                "file_classification",
-                "deterministic youtube course-video rule",
-                f"File: {file_meta.source_path}\nDescription: {file_desc or '[none available]'}",
-                parsed={
-                    "file_path": file_meta.source_path,
-                    "reason": reason,
-                    "category": Category.STUDY.value,
-                },
-            )
-            return ClassificationResult(
-                category=Category.STUDY,
-                reason=reason,
-            )
 
         system_prompt = self._file_system_prompt()
         user_prompt = self._file_user_prompt(
@@ -698,6 +788,7 @@ class LLMClassifier:
             "   Discussion solutions/answer keys that belong to discussion/section flow should still be study.\n"
             "B) Textbooks and readings are support, NOT study. Study guide folders/files always belong to support.\n"
             "C) Study should be lecture-aligned when possible.\n"
+            "D) YouTube/course-video URL or metadata files are study when they represent course video content.\n"
             "Rules:\n"
             "1. You receive a description of a folder with its structure, file listings,\n"
             "   and concatenated file descriptions from the database.\n"
@@ -782,18 +873,46 @@ class LLMClassifier:
             "4) by_type       (boolean)\n\n"
             "--- TASK EXTRACTION ---\n"
             "task_name:\n"
-            "- Infer a concise lowercase label from the actual folder path, names, descriptions, and context.\n"
-            "- Prefer labels already present in Known task names when they fit semantically.\n"
+            "- Infer a concise lowercase GENERAL MATERIAL/TASK TYPE from the actual folder path, names, "
+            "descriptions, and context.\n"
+            "- task_name is not the course topic, lecture title, web page filename, or source folder title.\n"
+            "- Prefer labels already present in Known task names only when they are valid general material/task types.\n"
             "- Use a new label when the evidence clearly supports it; otherwise use \"\".\n"
             "- Keep the label stable and semantic enough to group similar course materials.\n\n"
             "- Prefer the most precise matching material/task word supported by the path or filename.\n"
-            "- For lecture-area materials, avoid broad task_name \"lecture\" when a more specific label fits.\n"
-            "- Use task_name \"slides\" for slide decks, lecture PDFs, presentation files, or lecture handouts "
-            "whose purpose is slide/reading review.\n"
-            "- Use task_name \"boardwork\" for boardwork / whiteboard writing / handwritten board notes.\n"
+            "- Use canonical common labels when the evidence supports them: announcement, administrative, "
+            "boardwork, discussion, homework, lab, lecture, lecture_video, slide, project, quiz, reading, review, "
+            "resource, study_guide, textbook.\n"
+            "- Normalize common aliases: hw -> homework, disc/section/worksheet -> discussion, "
+            "proj -> project.\n"
+            "- Match compact numbered names to the canonical label when clear, e.g. hw03 -> homework, "
+            "disc10 -> discussion, lab2 -> lab.\n"
+            "- Do not use numbered discussion folder titles as task_name. For example, Disc 07, "
+            "Discussion 6, and [CS 61A SU25] Discussion 6 should be task_name discussion.\n"
+            "- Do not use term-specific final walkthrough or review titles as task_name. For example, "
+            "[CS 61A FA23] Final Walkthrough and Final Review (Su25) should be task_name review.\n"
+            "- Do not use solution wrapper folder names as task_name. For example, sol-disc08, "
+            "sol_disc08, and sol-hw03 should map to the underlying task type such as discussion or homework.\n"
+            "- Do not use course topics as task_name, even if they appear prominently in the path or title. "
+            "For example, higher-order functions, mutability, recursion, environments, SQL and tables, "
+            "objects and attributes, and tail calls are topics, not task names.\n"
+            "- Do not use filenames or filename-like labels as task_name. Never return labels containing file "
+            "extensions such as about.html or projects.html; use project only for project materials.\n"
+            "- Do not use a broad task_name like \"course\" to group all lecture-area materials.\n"
+            "- Use task_name \"lecture\" for numbered lecture-session bundles, including lecture slides, "
+            "lecture handouts, and companion demo/code files organized by lecture number. For example, "
+            "assets/slides/13.py should be task_name \"lecture\" with sequence_name inferred later as lecture_13.\n"
+            "- Use task_name \"slide\" only for standalone slide decks or presentation files that are not part "
+            "of a numbered lecture/session bundle.\n"
+            "- Use task_name \"boardwork\" only for lecture-area boardwork / whiteboard writing / handwritten "
+            "board notes, such as files under lec/lecture folders or lecture boardwork filenames.\n"
+            "- If boardwork belongs to a discussion/section/review flow, keep task_name \"discussion\" and "
+            "let sequence inference keep the discussion number, e.g. Discussion_8_Midsemester_Review_Boardwork.pdf "
+            "should be task_name discussion, not boardwork.\n"
+            "- Use task_name \"lecture_video\" for lecture recordings or course video files.\n"
             "- Treat folder names like lec/lecture/lectures as context, not automatically as task_name \"lecture\".\n\n"
             "- Do not use the broad category itself as task_name. Do not return "
-            "\"study\", \"practice\", or \"support\" as task_name.\n\n"
+            "\"study\", \"practice\", \"support\", or \"course\" as task_name.\n\n"
             "seq_name:\n"
             "- Always return \"\". Do not infer sequence names in this call.\n\n"
             "category_depth:\n"
@@ -802,9 +921,14 @@ class LLMClassifier:
             "- If task_name is not identified in this folder path, use 0.\n"
             "- category_depth may be greater than 2 for deeper paths.\n\n"
             "by_type:\n"
-            "- Set true if this folder's immediate children are organised by TASK/MEDIA TYPE, "
-            "so each child folder name should be treated as its own task_name.\n"
+            "- Set true if this folder's immediate children or immediate files contain multiple "
+            "GENERAL MATERIAL/TASK TYPES that should not share one task_name.\n"
+            "- When by_type is true, the pipeline will descend and infer task_name for children/files separately.\n"
+            "- Use this for lecture-area folders that mix slide decks, boardwork files, lecture_video files, "
+            "readings, or other material types.\n"
             "- Example: practice/ contains hw/, lab/, proj/ as different task types.\n"
+            "- Example: lec/ contains slides plus boardwork_*.pdf files; set by_type=true so boardwork "
+            "and slide are split.\n"
             "- Set false when children are sequential/topic variants of the same task or when unclear.\n\n"
             "Return a JSON object with EXACT keys:\n"
             "{\n"
@@ -880,7 +1004,6 @@ class LLMClassifier:
                     "description": entry.description,
                     "original_path": entry.original_path,
                     "relative_path": entry.relative_path,
-                    "extra_info": entry.extra_info,
                     "file_hash": entry.file_hash,
                 }
                 compact = json.dumps(db_fields, ensure_ascii=False)
@@ -912,7 +1035,8 @@ class LLMClassifier:
             "Hard rules:\n"
             "1) Discussion/section/tutorial/worksheet files are study by default.\n"
             "2) Textbook/readings/chapter/references are support (not study).\n"
-            "3) Study guides are support (even if the filename contains 'study').\n\n"
+            "3) Study guides are support (even if the filename contains 'study').\n"
+            "4) YouTube/course-video URL or metadata files are study when they represent course video content.\n\n"
             "Rules:\n"
             "1. You receive the file's name, path, description from the database,\n"
             "   and context from ancestor folders.\n"
@@ -985,18 +1109,46 @@ class LLMClassifier:
         "3) category_depth (integer from 0 to max depth of this file path)\n\n"
         "--- TASK EXTRACTION ---\n"
         "task_name:\n"
-        "- Infer a concise lowercase label from the actual file path, name, description, and nearby context.\n"
-        "- Prefer labels already present in Known task names when they fit semantically.\n"
+        "- Infer a concise lowercase GENERAL MATERIAL/TASK TYPE from the actual file path, name, "
+        "description, and nearby context.\n"
+        "- task_name is not the course topic, lecture title, web page filename, or source folder title.\n"
+        "- Prefer labels already present in Known task names only when they are valid general material/task types.\n"
         "- Use a new label when the evidence clearly supports it; otherwise use \"\".\n"
         "- Keep the label stable and semantic enough to group similar course materials.\n\n"
         "- Prefer the most precise matching material/task word supported by the path or filename.\n"
-        "- For lecture-area materials, avoid broad task_name \"lecture\" when a more specific label fits.\n"
-        "- Use task_name \"slides\" for slide decks, lecture PDFs, presentation files, or lecture handouts "
-        "whose purpose is slide/reading review.\n"
-        "- Use task_name \"boardwork\" for boardwork / whiteboard writing / handwritten board notes.\n"
+        "- Use canonical common labels when the evidence supports them: announcement, administrative, "
+        "boardwork, discussion, homework, lab, lecture, lecture_video, slide, project, quiz, reading, review, "
+        "resource, study_guide, textbook.\n"
+        "- Normalize common aliases: hw -> homework, disc/section/worksheet -> discussion, "
+        "proj -> project.\n"
+        "- Match compact numbered names to the canonical label when clear, e.g. hw03 -> homework, "
+        "disc10 -> discussion, lab2 -> lab.\n"
+        "- Do not use numbered discussion folder titles as task_name. For example, Disc 07, "
+        "Discussion 6, and [CS 61A SU25] Discussion 6 should be task_name discussion.\n"
+        "- Do not use term-specific final walkthrough or review titles as task_name. For example, "
+        "[CS 61A FA23] Final Walkthrough and Final Review (Su25) should be task_name review.\n"
+        "- Do not use solution wrapper folder names as task_name. For example, sol-disc08, "
+        "sol_disc08, and sol-hw03 should map to the underlying task type such as discussion or homework.\n"
+        "- Do not use course topics as task_name, even if they appear prominently in the path or title. "
+        "For example, higher-order functions, mutability, recursion, environments, SQL and tables, "
+        "objects and attributes, and tail calls are topics, not task names.\n"
+        "- Do not use filenames or filename-like labels as task_name. Never return labels containing file "
+        "extensions such as about.html or projects.html; use project only for project materials.\n"
+        "- Do not use a broad task_name like \"course\" to group all lecture-area materials.\n"
+        "- Use task_name \"lecture\" for numbered lecture-session bundles, including lecture slides, "
+        "lecture handouts, and companion demo/code files organized by lecture number. For example, "
+        "assets/slides/13.py should be task_name \"lecture\" with sequence_name inferred later as lecture_13.\n"
+        "- Use task_name \"slide\" only for standalone slide decks or presentation files that are not part "
+        "of a numbered lecture/session bundle.\n"
+        "- Use task_name \"boardwork\" only for lecture-area boardwork / whiteboard writing / handwritten "
+        "board notes, such as files under lec/lecture folders or lecture boardwork filenames.\n"
+        "- If boardwork belongs to a discussion/section/review flow, keep task_name \"discussion\" and "
+        "let sequence inference keep the discussion number, e.g. Discussion_8_Midsemester_Review_Boardwork.pdf "
+        "should be task_name discussion, not boardwork.\n"
+        "- Use task_name \"lecture_video\" for lecture recordings or course video files.\n"
         "- Treat folder names like lec/lecture/lectures as context, not automatically as task_name \"lecture\".\n\n"
         "- Do not use the broad category itself as task_name. Do not return "
-        "\"study\", \"practice\", or \"support\" as task_name.\n\n"
+        "\"study\", \"practice\", \"support\", or \"course\" as task_name.\n\n"
         "seq_name:\n"
         "- Always return \"\". Do not infer sequence names in this call.\n\n"
         "category_depth:\n"
@@ -1082,20 +1234,41 @@ class LLMClassifier:
             "4. When files in the same task batch share a textual sequence pattern, use that same textual pattern "
             "with each file's own number marker. For example, prefer Homework_4, Homework_5, Homework_6 over "
             "4, 5, 6; prefer Discussion_1, Discussion_2 over 1, 2; prefer lecture01, lecture02 over 01, 02.\n"
-            "5. Treat minor naming differences as the same sequence when they share the same task and number marker. "
-            "For example, hw3.zip and Homework_3__Path_Planning.pdf should both use Homework_3.\n"
-            "6. Prefer the most descriptive consistent label already visible in the batch or task-group context.\n"
-            "7. If the shared text is merely the task_name itself and adds no sequence meaning, do not duplicate it; "
+            "5. Normalize abbreviated task prefixes in sequence names to the canonical task_name. "
+            "For example, hw3 and homework3 should both use homework_3; proj0 and project0 should both "
+            "use project_0; disc10 and discussion10 should both use discussion_10.\n"
+            "6. Treat minor naming differences as the same sequence when they share the same task and number marker. "
+            "For example, hw3.zip and Homework_3__Path_Planning.pdf should both use homework_3.\n"
+            "7. Prefer the most descriptive consistent label already visible in the batch or task-group context, "
+            "but normalize task prefixes to lowercase canonical task_name plus underscore plus marker.\n"
+            "8. For assignment-like tasks such as homework, lab, project, and discussion, prefer the "
+            "task-specific assignment marker over term/year context. For example, "
+            "Spring_2023_EECS106B_Project_4.pdf should use project_4, not Spring_2023.\n"
+            "9. Do not use term/year markers such as spring2023, fall2023, sp23, or su25 as seq_name "
+            "for standalone slide, lecture, boardwork, lecture_video, quiz, assessment, resource, or textbook materials. "
+            "Leave seq_name blank unless there is a real lecture/chapter/assignment/part marker.\n"
+            "10. For discussion videos/files inside a discussion folder or title, use the discussion/session "
+            "number as seq_name and ignore per-video clip/question numbers. For example, "
+            "youtube/[CS 61A SU25] Discussion 6/3-Bear.webm should use discussion_6, not 3 or discussion_6_3.\n"
+            "11. For review videos/files, use final_review or midterm_review when that review type is visible. "
+            "Do not use per-video clip numbers as seq_name for review batches.\n"
+            "12. For boardwork materials, use seq_name only when the boardwork filename has an explicit "
+            "numeric marker, such as boardwork_1_31 -> 1_31. Do not inherit discussion or lecture "
+            "sequence labels such as Discussion_8.\n"
+            "13. If the shared text is merely the task_name itself and adds no sequence meaning, do not duplicate it; "
             "use the file's own number marker instead.\n"
-            "8. Leave seq_name blank when the label is not a clear sequence/order marker. "
+            "14. Leave seq_name blank when the label is not a clear sequence/order marker. "
             "Do not invent alphanumeric fragments from topic words, e.g. feedback_linearization should not become and3D.\n"
-            "9. seq_name must be the ordering/part marker, not the task type itself.\n"
-            "10. category_depth is the deepest source path folder level where sequence metadata appears. "
+            "15. For project materials, use seq_name \"final_project\" when the path, folder, filename, "
+            "or description clearly identifies the item as a final project, capstone project, or final "
+            "project guidelines. This separates final project material from ordinary numbered projects.\n"
+            "16. seq_name must be the ordering/part marker, not the task type itself.\n"
+            "17. category_depth is the deepest source path folder level where sequence metadata appears. "
             "If the sequence is identified from the filename, use the file's containing-folder depth.\n"
-            "11. For folder items, set by_sequence=true if the folder's direct children are organised by "
+            "18. For folder items, set by_sequence=true if the folder's direct children are organised by "
             "TOPIC/TIME SEQUENCE, such as lecture01/, lecture02/ or project topic folders in order. "
             "Set false for file items and for type-grouped or unclear folders.\n"
-            "12. Return one item for every input source_path, using the exact source_path. "
+            "19. Return one item for every input source_path, using the exact source_path. "
             "The source_path may refer to a file or folder.\n\n"
             "Return a JSON object with EXACT key \"items\", where each item has:\n"
             "{\n"
@@ -1207,7 +1380,7 @@ class LLMClassifier:
 
         system_prompt = (
             "You are helping to organize course files by assigning each file a task name.\n"
-            "A task name identifies the type of educational task or content group the file belongs to.\n\n"
+            "A task name identifies the general material/task type the file belongs to, not its topic or title.\n\n"
             "You will receive:\n"
             "  - The file/folder path\n"
             "  - Its category (study / practice / support)\n"
@@ -1215,17 +1388,35 @@ class LLMClassifier:
             "  - Ancestor folder context\n"
             "  - A set of known task names already identified in this course\n\n"
             "Rules:\n"
-            "1. Prefer matching a name from the known_task_names set when it fits.\n"
+            "1. Prefer matching a name from the known_task_names set only when it is a valid general material/task type.\n"
             "2. If none fit, propose a concise lowercase task name supported by the path, description, or context.\n"
             "3. Reason FIRST, then fill task_name.\n"
             "4. source_path MUST match exactly the path shown in the input.\n"
             "5. Use \"\" if no meaningful label is supported.\n"
             "6. Prefer the most precise matching material/task word. Exact words in the filename or path "
             "are stronger evidence than broad course-context folder names.\n"
-            "7. For lecture-area materials, avoid broad task_name \"lecture\" when a more specific label fits; "
-            "prefer \"slides\" for slide decks/lecture PDFs/presentation files and \"boardwork\" for "
-            "whiteboard or handwritten board notes.\n"
-            "8. Do not use the category itself as task_name; avoid study/practice/support as task labels.\n"
+            "7. For lecture-area materials, prefer \"lecture\" for numbered lecture-session bundles, "
+            "\"slide\" for standalone slide decks/presentation files, \"boardwork\" for lecture-area whiteboard or handwritten board notes, and "
+            "\"lecture_video\" for lecture recordings.\n"
+            "8. Use canonical common labels when the evidence supports them: announcement, administrative, "
+            "boardwork, discussion, homework, lab, lecture, lecture_video, slide, project, quiz, reading, review, "
+            "resource, study_guide, textbook.\n"
+            "9. Normalize common aliases: hw -> homework, disc/section/worksheet -> discussion, "
+            "proj -> project.\n"
+            "10. Match compact numbered names to the canonical label when clear, e.g. hw03 -> homework, "
+            "disc10 -> discussion, lab2 -> lab.\n"
+            "11. Do not use numbered discussion folder titles as task_name. For example, Disc 07, "
+            "Discussion 6, and [CS 61A SU25] Discussion 6 should be task_name discussion.\n"
+            "12. Do not use term-specific final walkthrough or review titles as task_name. For example, "
+            "[CS 61A FA23] Final Walkthrough and Final Review (Su25) should be task_name review.\n"
+            "13. Do not use course topics as task_name, even if they appear prominently in the path or title. "
+            "For example, higher-order functions, mutability, recursion, environments, SQL and tables, "
+            "objects and attributes, and tail calls are topics, not task names.\n"
+            "14. Do not use filenames or filename-like labels as task_name. Never return labels containing "
+            "file extensions such as about.html or projects.html; use project only for project materials.\n"
+            "15. Do not use a broad task_name like \"course\" to group all lecture-area materials; split "
+            "lecture, slide, boardwork, and lecture_video when the evidence supports them.\n"
+            "16. Do not use the category itself as task_name; avoid study/practice/support/course as task labels.\n"
         )
 
         lines: List[str] = []
